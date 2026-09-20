@@ -63,8 +63,22 @@ openai_api_key = _get("openai_api_key", None)
 openai_api_base = _get("openai_api_base", None)
 
 # Unified LLM provider settings
-llm_api_key = _get("llm_api_key") or openrouter_api_key or openai_api_key or ""
+# Support multiple API keys for load spreading: LLM_API_KEYS=sk-abc,sk-def,sk-ghi
+# Falls back to single key: LLM_API_KEY or OPENROUTER_API_KEY
+_single_key = _get("llm_api_key") or openrouter_api_key or openai_api_key or ""
+_multi_keys_raw = _get("llm_api_keys") or ""  # comma-separated
+
+if _multi_keys_raw:
+    llm_api_keys = [k.strip() for k in str(_multi_keys_raw).split(",") if k.strip()]
+else:
+    llm_api_keys = [_single_key] if _single_key else []
+
+# Keep single key for backward compat
+llm_api_key = _single_key
 llm_base_url = _get("llm_base_url") or openrouter_api_base or openai_api_base or "https://openrouter.ai/api/v1"
+
+import logging as _cfg_log
+_cfg_log.getLogger(__name__).info(f"LLM API keys loaded: {len(llm_api_keys)} key(s) for {llm_base_url}")
 
 # Bot owner ID (full control panel in DMs)
 owner_id = _get("owner_id", 6274319204)

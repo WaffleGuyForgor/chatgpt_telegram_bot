@@ -48,6 +48,19 @@ class PersonalityEngine:
             time_info += f" User timezone: {user_timezone}."
         parts.append(time_info)
 
+        # Language preference
+        if entity_id > 0:
+            lang = self.db.get_user_attribute(entity_id, "language")
+            if lang:
+                lang_names = {
+                    "en": "English", "ar": "Arabic", "es": "Spanish",
+                    "fr": "French", "de": "German", "pt": "Portuguese",
+                    "ru": "Russian", "zh": "Chinese", "ja": "Japanese",
+                    "ko": "Korean", "turkish": "Turkish", "fa": "Persian/Farsi",
+                }
+                lang_name = lang_names.get(lang, lang)
+                parts.append(f"IMPORTANT: The user has set their preferred language to {lang_name}. Always respond in {lang_name}.")
+
         # Style preferences for user
         if entity_id > 0:
             prefs = self.db.get_user_attribute(entity_id, "style_preferences")

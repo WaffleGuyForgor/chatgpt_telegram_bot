@@ -69,6 +69,14 @@ You can talk to me completely naturally — no special commands required:
 • <b>Off the record:</b> Say <i>"Don't remember this"</i> to keep a turn private.
 • <b>Multimodal:</b> Send voice messages, photos, or documents (PDF, TXT, code).
 
+<b>Quick Commands:</b>
+⚪ /new – Start fresh dialog
+⚪ /memory – View what I remember about you
+⚪ /memory_clear – Clear all my memories of you
+⚪ /status – Bot status & stats
+⚪ /ping – Latency check
+⚪ /lang – Set your preferred language
+
 👥 <b>In Group Chats:</b>
 • Mention me (@{bot_username}) or reply to my messages to chat.
 • Ask <i>"What did I miss?"</i> for a quick digest of recent discussions.
@@ -81,10 +89,11 @@ OWNER_HELP = """👑 <b>Owner Controls:</b>
 """
 
 
-def get_semaphore(entity_id: int) -> asyncio.Semaphore:
-    if entity_id not in semaphores:
-        semaphores[entity_id] = asyncio.Semaphore(1)
-    return semaphores[entity_id]
+def get_semaphore(user_id: int) -> asyncio.Semaphore:
+    """Per-user semaphore — two different users can talk simultaneously."""
+    if user_id not in semaphores:
+        semaphores[user_id] = asyncio.Semaphore(1)
+    return semaphores[user_id]
 
 
 def get_entity_id(update: Update) -> int:
@@ -284,8 +293,9 @@ async def process_user_turn(
         reply_context=reply_context
     )
 
-    # 6. Lock Semaphore for this Entity
-    sem = get_semaphore(entity_id)
+    # 6. Lock Semaphore per-user (so different users can talk simultaneously in groups)
+    user_id = user.id if user else 0
+    sem = get_semaphore(user_id)
     if sem.locked():
         await update.message.reply_text("⏳ Working on your previous request, please wait a moment…", reply_to_message_id=update.message.id)
         return
@@ -420,12 +430,12 @@ async def process_user_turn(
 
     async with sem:
         task = asyncio.create_task(execute_turn())
-        active_tasks[entity_id] = task
+        active_tasks[user_id] = task
         try:
             await task
         finally:
-            if entity_id in active_tasks:
-                del active_tasks[entity_id]
+            if user_id in active_tasks:
+                del active_tasks[user_id]
 
 
 # =====================================================================
@@ -460,9 +470,9 @@ async def text_message_handle(update: Update, context: CallbackContext):
 
     # Cancel trigger in natural language
     if update.message.text.strip().lower() in ["cancel", "stop", "nevermind", "abort"]:
-        entity_id = get_entity_id(update)
-        if entity_id in active_tasks:
-            active_tasks[entity_id].cancel()
+        user_cancel_id = update.effective_user.id if update.effective_user else 0
+        if user_cancel_id in active_tasks:
+            active_tasks[user_cancel_id].cancel()
             await update.message.reply_text("🛑 Canceled.")
             return
 
@@ -624,12 +634,121 @@ async def new_dialog_handle(update: Update, context: CallbackContext):
 
 
 async def cancel_handle(update: Update, context: CallbackContext):
-    entity_id = get_entity_id(update)
-    if entity_id in active_tasks:
-        active_tasks[entity_id].cancel()
+    user_cancel_id = update.effective_user.id if update.effective_user else 0
+    if user_cancel_id in active_tasks:
+        active_tasks[user_cancel_id].cancel()
         await update.message.reply_text("🛑 Canceled.")
     else:
         await update.message.reply_text("Nothing active to cancel.")
+
+
+# =====================================================================
+# USER COMMANDS: /status, /ping, /memory, /memory_clear, /lang
+# =====================================================================
+
+async def status_handle(update: Update, context: CallbackContext):
+    """Shows bot status, model, API key pool stats, and user memory count."""
+    await register_chat_and_user(update, context)
+    user = update.effective_user
+    entity_id = get_entity_id(update)
+
+    pool_stats = openai_utils.get_api_pool().get_stats()
+    mem_count = len(db.get_active_memories(f"user:{entity_id}", entity_id))
+
+    model = (
+        db.get_user_attribute(entity_id, "current_model")
+        if entity_id > 0
+        else db.get_chat_attribute(entity_id, "current_model", config.default_model)
+    ) or config.default_model
+
+    total_users = db.get_total_users_count()
+    total_groups = db.get_total_groups_count()
+
+    text = (
+        "📊 <b>Bot Status</b>\n\n"
+        f"🤖 <b>Model:</b> <code>{model}</code>\n"
+        f"🌐 <b>Provider:</b> OpenRouter ({config.llm_base_url})\n"
+        f"🔑 <b>API Keys:</b> {pool_stats['active_keys']}/{pool_stats['total_keys']} active\n"
+        f"🧠 <b>Your memories:</b> {mem_count}\n"
+        f"👥 <b>Total users:</b> {total_users}\n"
+        f"💬 <b>Total groups:</b> {total_groups}\n"
+        f"⚡ <b>Streaming:</b> {'On' if config.enable_message_streaming else 'Off'}\n"
+    )
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def ping_handle(update: Update, context: CallbackContext):
+    """Simple latency check."""
+    start = datetime.now()
+    msg = await update.message.reply_text("🏓 Pinging…")
+    latency = (datetime.now() - start).total_seconds() * 1000
+    await msg.edit_text(f"🏓 Pong! <b>{latency:.0f}ms</b>", parse_mode=ParseMode.HTML)
+
+
+async def memory_handle(update: Update, context: CallbackContext):
+    """Shows what the bot remembers about the user."""
+    await register_chat_and_user(update, context)
+    user = update.effective_user
+    entity_id = get_entity_id(update)
+    scope = f"user:{entity_id}"
+
+    mems = db.get_active_memories(scope, entity_id)
+    if not mems:
+        await update.message.reply_text("🧠 I don't have any memories about you yet.\n\nJust talk to me naturally — I'll remember the important stuff!")
+        return
+
+    lines = [f"🧠 <b>What I remember about you:</b> ({len(mems)} items)\n"]
+    for m in mems[:20]:
+        cat = m.get("category", "fact").upper()
+        content = m.get("content", "")
+        lines.append(f"• <b>[{cat}]</b> {html.escape(content)}")
+
+    lines.append("\n<i>Ask me to forget any of these anytime.</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def memory_clear_handle(update: Update, context: CallbackContext):
+    """Clears all memories about the user."""
+    await register_chat_and_user(update, context)
+    entity_id = get_entity_id(update)
+    scope = f"user:{entity_id}"
+
+    count = db.clear_all_memories(scope, entity_id)
+    if count > 0:
+        await update.message.reply_text(f"🗑️ Cleared <b>{count}</b> memory items. I've forgotten everything about you.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text("I don't have any memories to clear.")
+
+
+async def lang_handle(update: Update, context: CallbackContext):
+    """Set preferred language for responses."""
+    await register_chat_and_user(update, context)
+    user = update.effective_user
+    entity_id = get_entity_id(update)
+
+    if not context.args:
+        current_lang = db.get_user_attribute(entity_id, "language") or "auto (detect)"
+        text = (
+            f"🌐 <b>Your language:</b> {current_lang}\n\n"
+            "Usage: <code>/lang en</code>, <code>/lang ar</code>, <code>/lang auto</code>\n\n"
+            "Supported: en, ar, es, fr, de, pt, ru, zh, ja, ko, tr, fa, auto"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        return
+
+    lang = context.args[0].strip().lower()
+    valid = ["auto", "en", "ar", "es", "fr", "de", "pt", "ru", "zh", "ja", "ko", "tr", "fa"]
+    if lang not in valid:
+        await update.message.reply_text(f"❌ Unknown language. Supported: {', '.join(valid)}")
+        return
+
+    if lang == "auto":
+        db.set_user_attribute(entity_id, "language", None)
+        await update.message.reply_text("🌐 Language set to <b>auto-detect</b>. I'll match your language.", parse_mode=ParseMode.HTML)
+    else:
+        db.set_user_attribute(entity_id, "language", lang)
+        await update.message.reply_text(f"🌐 Language set to <b>{lang}</b>. I'll respond in this language.", parse_mode=ParseMode.HTML)
 
 
 # --- Owner Panel ---
@@ -820,6 +939,11 @@ async def post_init(application: Application):
     commands = [
         BotCommand("/new", "Start fresh dialog"),
         BotCommand("/help", "Show help message"),
+        BotCommand("/status", "📊 Bot status & stats"),
+        BotCommand("/ping", "🏓 Latency check"),
+        BotCommand("/memory", "🧠 View my memories"),
+        BotCommand("/memory_clear", "🗑️ Clear all memories"),
+        BotCommand("/lang", "🌐 Set preferred language"),
     ]
     if config.owner_id:
         commands.append(BotCommand("/panel", "👑 Owner Control Panel"))
@@ -848,6 +972,13 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("help", help_handle))
     application.add_handler(CommandHandler("new", new_dialog_handle))
     application.add_handler(CommandHandler("cancel", cancel_handle))
+
+    # User utility commands
+    application.add_handler(CommandHandler("status", status_handle))
+    application.add_handler(CommandHandler("ping", ping_handle))
+    application.add_handler(CommandHandler("memory", memory_handle))
+    application.add_handler(CommandHandler("memory_clear", memory_clear_handle))
+    application.add_handler(CommandHandler("lang", lang_handle))
 
     # Owner commands
     application.add_handler(CommandHandler("panel", panel_command_handle))
