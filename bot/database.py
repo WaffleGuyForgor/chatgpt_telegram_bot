@@ -1,14 +1,31 @@
 from typing import Optional, Any, List, Dict
+import logging
 import pymongo
 import uuid
 from datetime import datetime
 
 import config
 
+logger = logging.getLogger(__name__)
+
 
 class Database:
     def __init__(self):
-        self.client = pymongo.MongoClient(config.mongodb_uri)
+        logger.info(f"Connecting to MongoDB: {config.mongodb_uri[:50]}...")
+        self.client = pymongo.MongoClient(
+            config.mongodb_uri,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=10000,
+        )
+        # Verify connection immediately
+        try:
+            self.client.admin.command("ping")
+            logger.info("MongoDB connection successful!")
+        except Exception as e:
+            logger.error(f"MongoDB connection FAILED: {e}")
+            logger.error("The bot will start but database features will not work until MongoDB is reachable.")
+
         self.db = self.client["chatgpt_telegram_bot"]
 
         self.user_collection = self.db["user"]
@@ -117,11 +134,17 @@ class Database:
 
     # ---------------- User Management ----------------
     def check_if_user_exists(self, user_id: int, raise_exception: bool = False) -> bool:
-        if self.user_collection.count_documents({"_id": user_id}) > 0:
-            return True
-        else:
+        try:
+            if self.user_collection.count_documents({"_id": user_id}) > 0:
+                return True
+            else:
+                if raise_exception:
+                    raise ValueError(f"User {user_id} does not exist")
+                return False
+        except Exception as e:
+            logger.error(f"MongoDB query failed in check_if_user_exists: {e}")
             if raise_exception:
-                raise ValueError(f"User {user_id} does not exist")
+                raise
             return False
 
     def add_new_user(

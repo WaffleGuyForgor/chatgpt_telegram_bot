@@ -120,28 +120,31 @@ async def register_chat_and_user(update: Update, context: CallbackContext):
     user = update.effective_user
     chat = update.effective_chat
 
-    if user:
-        if not db.check_if_user_exists(user.id):
-            db.add_new_user(
-                user_id=user.id,
-                chat_id=chat.id if chat else user.id,
-                username=user.username or "",
-                first_name=user.first_name or "",
-                last_name=user.last_name or ""
-            )
-            db.start_new_dialog(user.id)
-        else:
-            db.set_user_attribute(user.id, "last_interaction", datetime.now())
+    try:
+        if user:
+            if not db.check_if_user_exists(user.id):
+                db.add_new_user(
+                    user_id=user.id,
+                    chat_id=chat.id if chat else user.id,
+                    username=user.username or "",
+                    first_name=user.first_name or "",
+                    last_name=user.last_name or ""
+                )
+                db.start_new_dialog(user.id)
+            else:
+                db.set_user_attribute(user.id, "last_interaction", datetime.now())
 
-    if chat and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
-        db.add_or_update_chat(
-            chat.id,
-            title=chat.title or "Group",
-            chat_type=chat.type,
-            username=chat.username
-        )
-        if db.get_chat_attribute(chat.id, "current_dialog_id") is None:
-            db.start_new_dialog(chat.id)
+        if chat and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            db.add_or_update_chat(
+                chat.id,
+                title=chat.title or "Group",
+                chat_type=chat.type,
+                username=chat.username
+            )
+            if db.get_chat_attribute(chat.id, "current_dialog_id") is None:
+                db.start_new_dialog(chat.id)
+    except Exception as e:
+        logger.error(f"Database error in register_chat_and_user: {e}")
 
 
 async def should_respond_in_group(update: Update, context: CallbackContext) -> bool:

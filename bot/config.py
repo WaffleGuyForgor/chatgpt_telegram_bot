@@ -95,15 +95,37 @@ embedding_api_key = _get("embedding_api_key") or llm_api_key
 embedding_base_url = _get("embedding_base_url") or llm_base_url
 embedding_model = _get("embedding_model", "text-embedding-3-small")
 
-# mongodb: explicit URI wins (Railway plugin provides MONGO_URL or MONGODB_URI)
-mongodb_uri = (
-    _get("mongodb_uri")
-    or _get("mongo_url")
-    or _get("mongo_private_url")
-    or _get("database_url")
-)
+# mongodb: check every Railway / Atlas / docker-compose variable name
+_mongo_candidates = [
+    "mongodb_uri", "mongo_url", "mongo_private_url", "database_url",
+    "MONGO_URL", "MONGODB_URI", "MONGO_PRIVATE_URL", "DATABASE_URL",
+    "MONGOHQ_URL", "MONGOLAB_URI", "MONGODB_URL", "DB_URL",
+    "MONGO_URI", "MONGOHOST", "MONGO_HOST",
+]
+mongodb_uri = None
+
+# Log all env vars that contain "mongo" or "database" for debugging
+import logging as _cfg_log
+_cfg_log.getLogger(__name__).info("Scanning for MongoDB connection variables...")
+for _k, _v in os.environ.items():
+    _kl = _k.lower()
+    if "mongo" in _kl or "database" in _kl or "db_" in _kl:
+        # Don't log passwords in full
+        _display = _v[:60] + "..." if len(_v) > 60 else _v
+        _cfg_log.getLogger(__name__).info(f"  Found env: {_k}={_display}")
+
+for _candidate in _mongo_candidates:
+    val = os.environ.get(_candidate) or config_env.get(_candidate)
+    if val and val.startswith(("mongodb://", "mongodb+srv://")):
+        mongodb_uri = val
+        _cfg_log.getLogger(__name__).info(f"MongoDB URI resolved from env var: {_candidate}")
+        break
+
 if not mongodb_uri:
-    mongodb_uri = f"mongodb://mongo:{config_env.get('MONGODB_PORT', os.environ.get('MONGODB_PORT', '27017'))}"
+    # Docker-compose fallback
+    _mongo_port = config_env.get("MONGODB_PORT", os.environ.get("MONGODB_PORT", "27017"))
+    mongodb_uri = f"mongodb://mongo:{_mongo_port}"
+    _cfg_log.getLogger(__name__).warning(f"No MongoDB env var found! Falling back to docker-compose: {mongodb_uri}")
 
 # chat_modes
 with open(config_dir / 'chat_modes.yml', 'r', encoding="utf-8") as f:
