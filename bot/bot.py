@@ -1,11 +1,15 @@
 import io
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+
+import html
+import json
 import logging
 import asyncio
 import traceback
-import html
-import json
 from datetime import datetime
-import openai
+from typing import Optional, Dict, Any, List
 
 import telegram
 from telegram import (
@@ -25,815 +29,806 @@ from telegram.ext import (
     AIORateLimiter,
     filters
 )
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ParseMode, ChatAction, ChatType
 
 import config
 import database
 import openai_utils
+from memory import MemoryEngine
+from multimodal import MultimodalInterpreter
+from personality import PersonalityEngine
+from group_engine import GroupEngine
+from context_engine import ConversationContextEngine
 
-import base64
-
-# setup
-db = database.Database()
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-user_semaphores = {}
-user_tasks = {}
+# Core singletons
+db = database.Database()
+memory_engine = MemoryEngine(db)
+multimodal = MultimodalInterpreter(db)
+personality = PersonalityEngine(db)
+group_engine = GroupEngine(db)
+context_engine = ConversationContextEngine(db)
 
-HELP_MESSAGE = """Commands:
-⚪ /retry – Regenerate last bot answer
-⚪ /new – Start new dialog
-⚪ /mode – Select chat mode
-⚪ /settings – Show settings
-⚪ /balance – Show balance
-⚪ /help – Show help
+# Locks and active tasks
+semaphores: Dict[int, asyncio.Semaphore] = {}
+active_tasks: Dict[int, asyncio.Task] = {}
+seen_updates = set()
 
-🎨 Generate images from text prompts in <b>👩‍🎨 Artist</b> /mode
-👥 Add bot to <b>group chat</b>: /help_group_chat
-🎤 You can send <b>Voice Messages</b> instead of text
+HELP_MESSAGE = """🤖 <b>Personal AI Assistant</b>
+
+You can talk to me completely naturally — no special commands required:
+• <b>Ask anything:</b> Coding, brainstorming, analysis, writing, or discussion.
+• <b>Remember facts:</b> Say <i>"Remember that my project is called Aurora"</i>.
+• <b>Forget facts:</b> Say <i>"Forget my project name"</i>.
+• <b>View memories:</b> Ask <i>"What do you remember about me?"</i>.
+• <b>Off the record:</b> Say <i>"Don't remember this"</i> to keep a turn private.
+• <b>Multimodal:</b> Send voice messages, photos, or documents (PDF, TXT, code).
+
+👥 <b>In Group Chats:</b>
+• Mention me (@{bot_username}) or reply to my messages to chat.
+• Ask <i>"What did I miss?"</i> for a quick digest of recent discussions.
 """
 
-HELP_GROUP_CHAT_MESSAGE = """You can add bot to any <b>group chat</b> to help and entertain its participants!
-
-Instructions (see <b>video</b> below):
-1. Add the bot to the group chat
-2. Make it an <b>admin</b>, so that it can see messages (all other rights can be restricted)
-3. You're awesome!
-
-To get a reply from the bot in the chat – @ <b>tag</b> it or <b>reply</b> to its message.
-For example: "{bot_username} write a poem about Telegram"
+OWNER_HELP = """👑 <b>Owner Controls:</b>
+⚪ /panel – Open the Owner Control Panel
+⚪ /sethome – Designate current group as Home Chat
+⚪ /broadcast &lt;text&gt; – Announcement to all users & groups
 """
 
 
-def split_text_into_chunks(text, chunk_size):
-    for i in range(0, len(text), chunk_size):
-        yield text[i:i + chunk_size]
+def get_semaphore(entity_id: int) -> asyncio.Semaphore:
+    if entity_id not in semaphores:
+        semaphores[entity_id] = asyncio.Semaphore(1)
+    return semaphores[entity_id]
 
 
-async def register_user_if_not_exists(update: Update, context: CallbackContext, user: User):
-    if not db.check_if_user_exists(user.id):
-        db.add_new_user(
-            user.id,
-            update.message.chat_id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name= user.last_name
-        )
-        db.start_new_dialog(user.id)
-
-    if db.get_user_attribute(user.id, "current_dialog_id") is None:
-        db.start_new_dialog(user.id)
-
-    if user.id not in user_semaphores:
-        user_semaphores[user.id] = asyncio.Semaphore(1)
-
-    if db.get_user_attribute(user.id, "current_model") is None:
-        db.set_user_attribute(user.id, "current_model", config.models["available_text_models"][0])
-
-    # back compatibility for n_used_tokens field
-    n_used_tokens = db.get_user_attribute(user.id, "n_used_tokens")
-    if isinstance(n_used_tokens, int) or isinstance(n_used_tokens, float):  # old format
-        new_n_used_tokens = {
-            "gpt-3.5-turbo": {
-                "n_input_tokens": 0,
-                "n_output_tokens": n_used_tokens
-            }
-        }
-        db.set_user_attribute(user.id, "n_used_tokens", new_n_used_tokens)
-
-    # voice message transcription
-    if db.get_user_attribute(user.id, "n_transcribed_seconds") is None:
-        db.set_user_attribute(user.id, "n_transcribed_seconds", 0.0)
-
-    # image generation
-    if db.get_user_attribute(user.id, "n_generated_images") is None:
-        db.set_user_attribute(user.id, "n_generated_images", 0)
+def get_entity_id(update: Update) -> int:
+    if update.effective_chat and update.effective_chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        return update.effective_chat.id
+    return update.effective_user.id
 
 
-async def is_bot_mentioned(update: Update, context: CallbackContext):
-     try:
-         message = update.message
-
-         if message.chat.type == "private":
-             return True
-
-         if message.text is not None and ("@" + context.bot.username) in message.text:
-             return True
-
-         if message.reply_to_message is not None:
-             if message.reply_to_message.from_user.id == context.bot.id:
-                 return True
-     except Exception:
-         return True
-     else:
-         return False
+def is_owner(user_id: int) -> bool:
+    if config.owner_id is None:
+        return False
+    return int(user_id) == int(config.owner_id)
 
 
-async def start_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    user_id = update.message.from_user.id
-
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-    db.start_new_dialog(user_id)
-
-    reply_text = "Hi! I'm <b>ChatGPT</b> bot implemented with OpenAI API 🤖\n\n"
-    reply_text += HELP_MESSAGE
-
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
-    await show_chat_modes_handle(update, context)
-
-
-async def help_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-    await update.message.reply_text(HELP_MESSAGE, parse_mode=ParseMode.HTML)
-
-
-async def help_group_chat_handle(update: Update, context: CallbackContext):
-     await register_user_if_not_exists(update, context, update.message.from_user)
-     user_id = update.message.from_user.id
-     db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-     text = HELP_GROUP_CHAT_MESSAGE.format(bot_username="@" + context.bot.username)
-
-     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-     await update.message.reply_video(config.help_group_chat_video_path)
-
-
-async def retry_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
-
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-    dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
-    if len(dialog_messages) == 0:
-        await update.message.reply_text("No message to retry 🤷‍♂️")
-        return
-
-    last_dialog_message = dialog_messages.pop()
-    db.set_dialog_messages(user_id, dialog_messages, dialog_id=None)  # last message was removed from the context
-
-    await message_handle(update, context, message=last_dialog_message["user"], use_new_dialog_timeout=False)
-
-async def _vision_message_handle_fn(
-    update: Update, context: CallbackContext, use_new_dialog_timeout: bool = True
-):
-    logger.info('_vision_message_handle_fn')
-    user_id = update.message.from_user.id
-    current_model = db.get_user_attribute(user_id, "current_model")
-
-    if not config.models["info"][current_model].get("vision", False):
-        await update.message.reply_text(
-            "🥲 Image understanding is only available for <b>vision-capable</b> models (e.g. GPT-4o, GPT-4o mini, GPT-5.5 or Claude). Please change your model in /settings",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
-
-    # new dialog timeout
-    if use_new_dialog_timeout:
-        if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
-            db.start_new_dialog(user_id)
-            await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-    buf = None
-    if update.message.effective_attachment:
-        photo = update.message.effective_attachment[-1]
-        photo_file = await context.bot.get_file(photo.file_id)
-
-        # store file in memory, not on disk
-        buf = io.BytesIO()
-        await photo_file.download_to_memory(buf)
-        buf.name = "image.jpg"  # file extension is required
-        buf.seek(0)  # move cursor to the beginning of the buffer
-
-    # in case of CancelledError
-    n_input_tokens, n_output_tokens = 0, 0
-
-    try:
-        # send placeholder message to user
-        placeholder_message = await update.message.reply_text("...")
-        message = update.message.caption or update.message.text or ''
-
-        # send typing action
-        await update.message.chat.send_action(action="typing")
-
-        dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
-        parse_mode = {"html": ParseMode.HTML, "markdown": ParseMode.MARKDOWN}[
-            config.chat_modes[chat_mode]["parse_mode"]
-        ]
-
-        chatgpt_instance = openai_utils.ChatGPT(model=current_model)
-        if config.enable_message_streaming:
-            gen = chatgpt_instance.send_vision_message_stream(
-                message,
-                dialog_messages=dialog_messages,
-                image_buffer=buf,
-                chat_mode=chat_mode,
-            )
+def split_text_into_chunks(text: str, chunk_size: int = 4000) -> List[str]:
+    chunks = []
+    current = []
+    current_len = 0
+    for line in text.splitlines(keepends=True):
+        if current_len + len(line) > chunk_size:
+            chunks.append("".join(current))
+            current = [line]
+            current_len = len(line)
         else:
-            (
-                answer,
-                (n_input_tokens, n_output_tokens),
-                n_first_dialog_messages_removed,
-            ) = await chatgpt_instance.send_vision_message(
-                message,
-                dialog_messages=dialog_messages,
-                image_buffer=buf,
-                chat_mode=chat_mode,
+            current.append(line)
+            current_len += len(line)
+    if current:
+        chunks.append("".join(current))
+    return chunks or [text]
+
+
+async def register_chat_and_user(update: Update, context: CallbackContext):
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if user:
+        if not db.check_if_user_exists(user.id):
+            db.add_new_user(
+                user_id=user.id,
+                chat_id=chat.id if chat else user.id,
+                username=user.username or "",
+                first_name=user.first_name or "",
+                last_name=user.last_name or ""
             )
+            db.start_new_dialog(user.id)
+        else:
+            db.set_user_attribute(user.id, "last_interaction", datetime.now())
 
-            async def fake_gen():
-                yield "finished", answer, (
-                    n_input_tokens,
-                    n_output_tokens,
-                ), n_first_dialog_messages_removed
+    if chat and chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        db.add_or_update_chat(
+            chat.id,
+            title=chat.title or "Group",
+            chat_type=chat.type,
+            username=chat.username
+        )
+        if db.get_chat_attribute(chat.id, "current_dialog_id") is None:
+            db.start_new_dialog(chat.id)
 
-            gen = fake_gen()
 
-        prev_answer = ""
-        async for gen_item in gen:
-            (
-                status,
-                answer,
-                (n_input_tokens, n_output_tokens),
-                n_first_dialog_messages_removed,
-            ) = gen_item
+async def should_respond_in_group(update: Update, context: CallbackContext) -> bool:
+    message = update.message
+    if not message:
+        return False
 
-            answer = answer[:4096]  # telegram message limit
+    chat = update.effective_chat
+    if not chat or chat.type == ChatType.PRIVATE:
+        return True
 
-            # update only when 100 new symbols are ready
-            if abs(len(answer) - len(prev_answer)) < 100 and status != "finished":
-                continue
+    # 1. Replied to bot
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.id == context.bot.id:
+            return True
 
-            try:
-                await context.bot.edit_message_text(
-                    answer,
-                    chat_id=placeholder_message.chat_id,
-                    message_id=placeholder_message.message_id,
-                    parse_mode=parse_mode,
-                )
-            except telegram.error.BadRequest as e:
-                if str(e).startswith("Message is not modified"):
-                    continue
-                else:
+    # 2. Mentioned bot username
+    bot_username = context.bot.username or ""
+    text_content = (message.text or message.caption or "").lower()
+    if bot_username and f"@{bot_username.lower()}" in text_content:
+        return True
+
+    # 3. Check Home Chat
+    home_chat_id = db.get_global_setting("home_chat_id", None)
+    if home_chat_id is not None and int(chat.id) == int(home_chat_id):
+        return db.get_global_setting("home_auto_reply", True)
+
+    # 4. Check Group Auto-Reply setting
+    if db.get_chat_attribute(chat.id, "auto_reply", False):
+        return True
+
+    return False
+
+
+# =====================================================================
+# UNIFIED NATURAL CONVERSATION PIPELINE
+# =====================================================================
+
+async def process_user_turn(
+    update: Update,
+    context: CallbackContext,
+    raw_text: str,
+    image_data_url: Optional[str] = None,
+    document_context: Optional[str] = None,
+    initial_status: str = "Thinking…"
+):
+    user = update.effective_user
+    chat = update.effective_chat
+    entity_id = get_entity_id(update)
+    is_group = chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]
+    scope = f"group:{entity_id}" if is_group else f"user:{entity_id}"
+
+    # Strip bot mention in groups
+    clean_text = raw_text
+    if is_group and context.bot.username:
+        clean_text = clean_text.replace(f"@{context.bot.username}", "").strip()
+
+    # 1. Natural Language Memory Intent Check
+    intent, intent_arg = memory_engine.detect_memory_intent(clean_text)
+    is_off_the_record = (intent == "off_the_record")
+
+    if intent == "show":
+        mems = db.get_active_memories(scope, entity_id)
+        if not mems:
+            await update.message.reply_text("I don't have any saved memories for you yet. Just tell me what you'd like me to remember!")
+            return
+        lines = ["🧠 <b>Here is what I remember:</b>\n"]
+        for m in mems[:15]:
+            lines.append(f"• {html.escape(m.get('content', ''))}")
+        lines.append("\n<i>You can ask me to forget any of these anytime!</i>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    elif intent == "forget":
+        target = intent_arg or clean_text
+        count = db.delete_memories_by_keyword(scope, entity_id, target)
+        if count > 0:
+            await update.message.reply_text(f"✅ I've forgotten what I knew about <b>{html.escape(target)}</b>.", parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(f"I couldn't find any active memories matching <i>'{html.escape(target)}'</i>.", parse_mode=ParseMode.HTML)
+        return
+
+    elif intent == "explicit_remember":
+        fact = intent_arg or clean_text
+        db.add_memory(scope=scope, entity_id=entity_id, content=fact, category="personal", importance=0.8)
+        await update.message.reply_text(f"Got it! I'll remember that: <i>{html.escape(fact)}</i>", parse_mode=ParseMode.HTML)
+        return
+
+    elif intent == "memory_toggle":
+        if intent_arg == "off":
+            db.set_user_attribute(user.id, "memory_active", False)
+            await update.message.reply_text("Understood. I will no longer remember new information from our conversations.")
+        else:
+            db.set_user_attribute(user.id, "memory_active", True)
+            await update.message.reply_text("Memory resumed! I will remember relevant context from now on.")
+        return
+
+    # 2. Natural Group Digest Check ("What did I miss?")
+    if is_group and group_engine.is_digest_request(clean_text):
+        await update.message.chat.send_action(action=ChatAction.TYPING)
+        digest = await group_engine.generate_group_digest(chat.id, requester_name=user.first_name if user else "")
+        await update.message.reply_text(digest, parse_mode=ParseMode.HTML)
+        return
+
+    # 3. Resolve Reply Context
+    reply_context = None
+    if update.message.reply_to_message:
+        replied = update.message.reply_to_message
+        reply_sender = replied.from_user.first_name if replied.from_user else "User"
+        replied_text = replied.text or replied.caption or ""
+        if replied_text:
+            reply_context = f"{reply_sender}: {replied_text[:200]}"
+
+    # 4. Check for Image Follow-up ("make it darker", "what is this picture")
+    if not image_data_url:
+        image_data_url = multimodal.resolve_conversational_image(entity_id, clean_text)
+
+    # 5. Build LLM Messages via ConversationContextEngine
+    user_display_name = user.first_name if user else "User"
+    formatted_user_text = clean_text
+    if is_group:
+        formatted_user_text = group_engine.format_group_message_context(
+            sender_name=user_display_name,
+            text=clean_text,
+            reply_to_sender=update.message.reply_to_message.from_user.first_name if update.message.reply_to_message and update.message.reply_to_message.from_user else None,
+            reply_to_text=update.message.reply_to_message.text if update.message.reply_to_message else None
+        )
+
+    llm_messages = await context_engine.build_llm_messages(
+        entity_id=entity_id,
+        current_user_text=formatted_user_text,
+        user_name=user_display_name,
+        is_group=is_group,
+        group_title=chat.title if is_group else "",
+        image_data_url=image_data_url,
+        document_context=document_context,
+        reply_context=reply_context
+    )
+
+    # 6. Lock Semaphore for this Entity
+    sem = get_semaphore(entity_id)
+    if sem.locked():
+        await update.message.reply_text("⏳ Working on your previous request, please wait a moment…", reply_to_message_id=update.message.id)
+        return
+
+    current_model = (
+        db.get_user_attribute(entity_id, "current_model")
+        if entity_id > 0
+        else db.get_chat_attribute(entity_id, "current_model", config.default_model)
+    ) or config.default_model
+
+    chatgpt_client = openai_utils.ChatGPT(model=current_model)
+
+    async def execute_turn():
+        # Send initial status
+        placeholder = await update.message.reply_text(initial_status, reply_to_message_id=update.message.id)
+        await update.message.chat.send_action(action=ChatAction.TYPING)
+
+        answer = ""
+        n_input_tokens = 0
+        n_output_tokens = 0
+
+        try:
+            if config.enable_message_streaming:
+                gen = chatgpt_client.send_message_stream(llm_messages)
+                prev_text = ""
+                last_edit_time = asyncio.get_event_loop().time()
+
+                async for status, text_chunk, (n_in, n_out) in gen:
+                    answer = text_chunk
+                    n_input_tokens, n_output_tokens = n_in, n_out
+                    now = asyncio.get_event_loop().time()
+
+                    # Throttle edits to respect Telegram limits
+                    if (abs(len(answer) - len(prev_text)) >= 70 or status == "finished") and (now - last_edit_time >= 0.4 or status == "finished"):
+                        display_text = answer[:4000]
+                        try:
+                            await context.bot.edit_message_text(
+                                display_text,
+                                chat_id=placeholder.chat_id,
+                                message_id=placeholder.message_id,
+                                parse_mode=ParseMode.HTML
+                            )
+                        except telegram.error.BadRequest as e:
+                            if "Message is not modified" not in str(e):
+                                # Fallback to plain text if HTML tags broken
+                                try:
+                                    await context.bot.edit_message_text(
+                                        display_text,
+                                        chat_id=placeholder.chat_id,
+                                        message_id=placeholder.message_id
+                                    )
+                                except Exception:
+                                    pass
+                        prev_text = answer
+                        last_edit_time = now
+            else:
+                answer, (n_input_tokens, n_output_tokens) = await chatgpt_client.send_message(llm_messages)
+                try:
                     await context.bot.edit_message_text(
-                        answer,
-                        chat_id=placeholder_message.chat_id,
-                        message_id=placeholder_message.message_id,
+                        answer[:4000],
+                        chat_id=placeholder.chat_id,
+                        message_id=placeholder.message_id,
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    await context.bot.edit_message_text(
+                        answer[:4000],
+                        chat_id=placeholder.chat_id,
+                        message_id=placeholder.message_id
                     )
 
-            await asyncio.sleep(0.01)  # wait a bit to avoid flooding
+            # Send remaining chunks if response exceeds Telegram 4096 character limit
+            if len(answer) > 4000:
+                for chunk in split_text_into_chunks(answer[4000:]):
+                    try:
+                        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+                    except Exception:
+                        await update.message.reply_text(chunk)
 
-            prev_answer = answer
+            # Persist dialog message
+            turn_record = {
+                "user": formatted_user_text,
+                "bot": answer,
+                "date": datetime.now()
+            }
+            db.set_dialog_messages(entity_id, db.get_dialog_messages(entity_id) + [turn_record])
+            db.update_n_used_tokens(entity_id, current_model, n_input_tokens, n_output_tokens)
 
-        # update user data
-        if buf is not None:
-            base_image = base64.b64encode(buf.getvalue()).decode("utf-8")
-            new_dialog_message = {"user": [
-                        {
-                            "type": "text",
-                            "text": message,
-                        },
-                        {
-                            "type": "image",
-                            "image": base_image,
-                        }
-                    ]
-                , "bot": answer, "date": datetime.now()}
-        else:
-            new_dialog_message = {"user": [{"type": "text", "text": message}], "bot": answer, "date": datetime.now()}
-        
-        db.set_dialog_messages(
-            user_id,
-            db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
-            dialog_id=None
-        )
+            # Update conversational state for natural follow-ups ("make it shorter", "another version")
+            db.set_conversational_state(entity_id, {
+                "last_output": answer,
+                "last_user_query": clean_text
+            })
 
-        db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
+            # Silently adapt user communication style
+            if entity_id > 0:
+                personality.adapt_user_style_from_message(entity_id, clean_text)
 
-    except asyncio.CancelledError:
-        # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
-        db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
-        raise
-
-    except Exception as e:
-        error_text = f"Something went wrong during completion. Reason: {e}"
-        logger.error(error_text)
-        await update.message.reply_text(error_text)
-        return
-
-async def unsupport_message_handle(update: Update, context: CallbackContext, message=None):
-    # check if bot was mentioned (for group chats)
-    if not await is_bot_mentioned(update, context):
-        return
-
-    error_text = f"I don't know how to read files or videos. Send the picture in normal mode (Quick Mode)."
-    logger.error(error_text)
-    await update.message.reply_text(error_text)
-    return
-
-async def message_handle(update: Update, context: CallbackContext, message=None, use_new_dialog_timeout=True):
-    # check if bot was mentioned (for group chats)
-    if not await is_bot_mentioned(update, context):
-        return
-
-    # check if message is edited
-    if update.edited_message is not None:
-        await edited_message_handle(update, context)
-        return
-
-    _message = message or update.message.text
-
-    # remove bot mention (in group chats)
-    if update.message.chat.type != "private":
-        _message = _message.replace("@" + context.bot.username, "").strip()
-
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
-
-    user_id = update.message.from_user.id
-    chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
-
-    if chat_mode == "artist":
-        await generate_image_handle(update, context, message=message)
-        return
-
-    current_model = db.get_user_attribute(user_id, "current_model")
-
-    async def message_handle_fn():
-        # new dialog timeout
-        if use_new_dialog_timeout:
-            if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
-                db.start_new_dialog(user_id)
-                await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
-        db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-        # in case of CancelledError
-        n_input_tokens, n_output_tokens = 0, 0
-
-        try:
-            # send placeholder message to user
-            placeholder_message = await update.message.reply_text("...")
-
-            # send typing action
-            await update.message.chat.send_action(action="typing")
-
-            if _message is None or len(_message) == 0:
-                 await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
-                 return
-
-            dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
-            parse_mode = {
-                "html": ParseMode.HTML,
-                "markdown": ParseMode.MARKDOWN
-            }[config.chat_modes[chat_mode]["parse_mode"]]
-
-            chatgpt_instance = openai_utils.ChatGPT(model=current_model)
-            if config.enable_message_streaming:
-                gen = chatgpt_instance.send_message_stream(_message, dialog_messages=dialog_messages, chat_mode=chat_mode)
-            else:
-                answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = await chatgpt_instance.send_message(
-                    _message,
-                    dialog_messages=dialog_messages,
-                    chat_mode=chat_mode
+            # Background Tasks: Memory Extraction & Rolling Summarization (Non-blocking!)
+            if not is_off_the_record:
+                is_mem_active = (
+                    db.get_user_attribute(entity_id, "memory_active")
+                    if entity_id > 0 else True
                 )
+                if is_mem_active and config.memory_enabled:
+                    asyncio.create_task(
+                        memory_engine.extract_and_update_memory(
+                            scope=scope,
+                            entity_id=entity_id,
+                            user_message=clean_text,
+                            bot_response=answer
+                        )
+                    )
 
-                async def fake_gen():
-                    yield "finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
-
-                gen = fake_gen()
-
-            prev_answer = ""
-            
-            async for gen_item in gen:
-                status, answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = gen_item
-
-                answer = answer[:4096]  # telegram message limit
-                    
-                # update only when 100 new symbols are ready
-                if abs(len(answer) - len(prev_answer)) < 100 and status != "finished":
-                    continue
-
-                try:
-                    await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
-                except telegram.error.BadRequest as e:
-                    if str(e).startswith("Message is not modified"):
-                        continue
-                    else:
-                        await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
-
-                await asyncio.sleep(0.01)  # wait a bit to avoid flooding
-                
-                prev_answer = answer
-            
-            # update user data
-            new_dialog_message = {"user": [{"type": "text", "text": _message}], "bot": answer, "date": datetime.now()}
-
-            db.set_dialog_messages(
-                user_id,
-                db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
-                dialog_id=None
-            )
-
-            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
+            # Background rolling summarization if dialog grows long
+            asyncio.create_task(context_engine.maybe_summarize_in_background(entity_id))
 
         except asyncio.CancelledError:
-            # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
-            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
+            await update.message.reply_text("🛑 Canceled.")
             raise
-
         except Exception as e:
-            error_text = f"Something went wrong during completion. Reason: {e}"
-            logger.error(error_text)
-            await update.message.reply_text(error_text)
-            return
+            logger.error(f"Error in turn execution: {traceback.format_exc()}")
+            friendly_err = "I couldn't complete that response right now. Please try again in a moment."
+            try:
+                await context.bot.edit_message_text(
+                    friendly_err,
+                    chat_id=placeholder.chat_id,
+                    message_id=placeholder.message_id
+                )
+            except Exception:
+                await update.message.reply_text(friendly_err)
 
-        # send message if some messages were removed from the context
-        if n_first_dialog_messages_removed > 0:
-            if n_first_dialog_messages_removed == 1:
-                text = "✍️ <i>Note:</i> Your current dialog is too long, so your <b>first message</b> was removed from the context.\n Send /new command to start new dialog"
-            else:
-                text = f"✍️ <i>Note:</i> Your current dialog is too long, so <b>{n_first_dialog_messages_removed} first messages</b> were removed from the context.\n Send /new command to start new dialog"
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-    async with user_semaphores[user_id]:
-        model_supports_vision = config.models["info"][current_model].get("vision", False)
-        photo_sent = update.message.photo is not None and len(update.message.photo) > 0
-        if model_supports_vision or photo_sent:
-            if not model_supports_vision:
-                # a photo was sent but the selected model can't read images:
-                # fall back to a vision-capable default
-                current_model = "gpt-4o"
-                db.set_user_attribute(user_id, "current_model", "gpt-4o")
-            task = asyncio.create_task(
-                _vision_message_handle_fn(update, context, use_new_dialog_timeout=use_new_dialog_timeout)
-            )
-        else:
-            task = asyncio.create_task(
-                message_handle_fn()
-            )
-
-        user_tasks[user_id] = task
-
+    async with sem:
+        task = asyncio.create_task(execute_turn())
+        active_tasks[entity_id] = task
         try:
             await task
-        except asyncio.CancelledError:
-            await update.message.reply_text("✅ Canceled", parse_mode=ParseMode.HTML)
-        else:
-            pass
         finally:
-            if user_id in user_tasks:
-                del user_tasks[user_id]
+            if entity_id in active_tasks:
+                del active_tasks[entity_id]
 
 
-async def is_previous_message_not_answered_yet(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
+# =====================================================================
+# TELEGRAM HANDLERS
+# =====================================================================
 
-    user_id = update.message.from_user.id
-    if user_semaphores[user_id].locked():
-        text = "⏳ Please <b>wait</b> for a reply to the previous message\n"
-        text += "Or you can /cancel it"
-        await update.message.reply_text(text, reply_to_message_id=update.message.id, parse_mode=ParseMode.HTML)
-        return True
-    else:
-        return False
+async def text_message_handle(update: Update, context: CallbackContext):
+    if update.edited_message or not update.message or not update.message.text:
+        return
+
+    # Check duplicate update
+    if update.update_id in seen_updates:
+        return
+    seen_updates.add(update.update_id)
+    if len(seen_updates) > 5000:
+        seen_updates.clear()
+
+    await register_chat_and_user(update, context)
+
+    # In groups: store message in digest buffer for 'What did I miss?'
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        db.append_group_message_buffer(
+            chat.id,
+            sender_name=user.first_name if user else "Member",
+            sender_id=user.id if user else 0,
+            text=update.message.text
+        )
+        if not await should_respond_in_group(update, context):
+            return
+
+    # Cancel trigger in natural language
+    if update.message.text.strip().lower() in ["cancel", "stop", "nevermind", "abort"]:
+        entity_id = get_entity_id(update)
+        if entity_id in active_tasks:
+            active_tasks[entity_id].cancel()
+            await update.message.reply_text("🛑 Canceled.")
+            return
+
+    await process_user_turn(
+        update=update,
+        context=context,
+        raw_text=update.message.text,
+        initial_status="Thinking…"
+    )
+
+
+async def photo_message_handle(update: Update, context: CallbackContext):
+    if update.edited_message or not update.message:
+        return
+
+    await register_chat_and_user(update, context)
+    chat = update.effective_chat
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        if not await should_respond_in_group(update, context):
+            return
+
+    entity_id = get_entity_id(update)
+    caption, image_url = await multimodal.process_photo(update, context, entity_id)
+
+    await process_user_turn(
+        update=update,
+        context=context,
+        raw_text=caption or "What is in this image?",
+        image_data_url=image_url,
+        initial_status="Inspecting image…"
+    )
 
 
 async def voice_message_handle(update: Update, context: CallbackContext):
-    # check if bot was mentioned (for group chats)
-    if not await is_bot_mentioned(update, context):
+    if not update.message or not update.message.voice:
         return
 
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
+    await register_chat_and_user(update, context)
+    chat = update.effective_chat
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        if not await should_respond_in_group(update, context):
+            return
 
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+    status_msg = await update.message.reply_text("🎤 Transcribing voice…", reply_to_message_id=update.message.id)
+    try:
+        transcript, duration = await multimodal.process_voice(update, context)
+    except Exception as e:
+        logger.error(f"Voice error: {e}")
+        await status_msg.edit_text("Could not transcribe voice audio.")
+        return
 
-    voice = update.message.voice
-    voice_file = await context.bot.get_file(voice.file_id)
-    
-    # store file in memory, not on disk
-    buf = io.BytesIO()
-    await voice_file.download_to_memory(buf)
-    buf.name = "voice.oga"  # file extension is required
-    buf.seek(0)  # move cursor to the beginning of the buffer
+    if not transcript:
+        await status_msg.edit_text("Could not detect any speech in the audio.")
+        return
 
-    transcribed_text = await openai_utils.transcribe_audio(buf)
-    text = f"🎤: <i>{transcribed_text}</i>"
+    await status_msg.delete()
+    await process_user_turn(
+        update=update,
+        context=context,
+        raw_text=transcript,
+        initial_status="Thinking…"
+    )
+
+
+async def document_message_handle(update: Update, context: CallbackContext):
+    if not update.message or not update.message.document:
+        return
+
+    await register_chat_and_user(update, context)
+    chat = update.effective_chat
+    if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+        if not await should_respond_in_group(update, context):
+            return
+
+    status_msg = await update.message.reply_text("📄 Reading document…", reply_to_message_id=update.message.id)
+    caption, doc_text = await multimodal.process_document(update, context)
+    await status_msg.delete()
+
+    await process_user_turn(
+        update=update,
+        context=context,
+        raw_text=caption or "Please analyze this document.",
+        document_context=doc_text,
+        initial_status="Analyzing document…"
+    )
+
+
+# =====================================================================
+# COMMANDS & OWNER PANEL
+# =====================================================================
+
+async def start_handle(update: Update, context: CallbackContext):
+    await register_chat_and_user(update, context)
+    user = update.effective_user
+    chat = update.effective_chat
+
+    bot_user = context.bot.username or "Bot"
+    text = (
+        f"Hey <b>{html.escape(user.first_name)}</b> — I'm your personal AI assistant.\n\n"
+        "You can talk to me normally. I remember context across our conversations, adapt to how you like to work, "
+        "and can read images, documents, and voice messages.\n\n"
+        "What are we working on today?"
+    )
+
+    keyboard = []
+    if chat.type == ChatType.PRIVATE and is_owner(user.id):
+        keyboard.append([InlineKeyboardButton("👑 Owner Control Panel", callback_data="owner_panel|main")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+
+async def help_handle(update: Update, context: CallbackContext):
+    await register_chat_and_user(update, context)
+    bot_user = context.bot.username or "Bot"
+    text = HELP_MESSAGE.format(bot_username=bot_user)
+    if is_owner(update.effective_user.id):
+        text += "\n" + OWNER_HELP
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-    # update n_transcribed_seconds
-    db.set_user_attribute(user_id, "n_transcribed_seconds", voice.duration + db.get_user_attribute(user_id, "n_transcribed_seconds"))
 
-    await message_handle(update, context, message=transcribed_text)
+async def sethome_handle(update: Update, context: CallbackContext):
+    await register_chat_and_user(update, context)
+    user = update.effective_user
+    chat = update.effective_chat
 
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Only the bot owner can configure the Home Chat.")
+        return
 
-async def generate_image_handle(update: Update, context: CallbackContext, message=None):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
+    if chat.type == ChatType.PRIVATE:
+        home_id = db.get_global_setting("home_chat_id", None)
+        home_title = db.get_global_setting("home_chat_title", "None")
+        await update.message.reply_text(
+            f"🏠 Current Home Chat: <b>{html.escape(str(home_title))}</b> (ID: <code>{home_id}</code>)\n\n"
+            "To set a new home chat, run <code>/sethome</code> directly inside the target group!",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+    db.set_global_setting("home_chat_id", chat.id)
+    db.set_global_setting("home_chat_title", chat.title or "Home Group")
+    db.set_global_setting("home_auto_reply", True)
+    db.set_chat_attribute(chat.id, "auto_reply", True)
 
-    await update.message.chat.send_action(action="upload_photo")
-
-    message = message or update.message.text
-
-    try:
-        images = await openai_utils.generate_images(message, n_images=config.return_n_generated_images, size=config.image_size)
-    except openai.BadRequestError as e:
-        if str(e).startswith("Your request was rejected as a result of our safety system"):
-            text = "🥲 Your request <b>doesn't comply</b> with OpenAI's usage policies.\nWhat did you write there, huh?"
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-            return
-        else:
-            raise
-
-    # usage accounting
-    db.set_user_attribute(user_id, "n_generated_images", len(images) + db.get_user_attribute(user_id, "n_generated_images"))
-
-    for image in images:
-        await update.message.chat.send_action(action="upload_photo")
-        await update.message.reply_photo(io.BytesIO(image))
+    text = (
+        f"🏠 <b>Home Chat Activated!</b>\n\n"
+        f"This group (<b>{html.escape(chat.title or 'Group')}</b>) is now configured as the Home Chat.\n"
+        "✨ I will now actively chat and respond to all members here!"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def new_dialog_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
-
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-    db.set_user_attribute(user_id, "current_model", "gpt-4o-mini")
-
-    db.start_new_dialog(user_id)
-    await update.message.reply_text("Starting new dialog ✅")
-
-    chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
-    await update.message.reply_text(f"{config.chat_modes[chat_mode]['welcome_message']}", parse_mode=ParseMode.HTML)
+    await register_chat_and_user(update, context)
+    entity_id = get_entity_id(update)
+    db.start_new_dialog(entity_id)
+    await update.message.reply_text("🔄 Started a fresh dialog. What's on your mind?")
 
 
 async def cancel_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-    if user_id in user_tasks:
-        task = user_tasks[user_id]
-        task.cancel()
+    entity_id = get_entity_id(update)
+    if entity_id in active_tasks:
+        active_tasks[entity_id].cancel()
+        await update.message.reply_text("🛑 Canceled.")
     else:
-        await update.message.reply_text("<i>Nothing to cancel...</i>", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("Nothing active to cancel.")
 
 
-def get_chat_mode_menu(page_index: int):
-    n_chat_modes_per_page = config.n_chat_modes_per_page
-    text = f"Select <b>chat mode</b> ({len(config.chat_modes)} modes available):"
+# --- Owner Panel ---
 
-    # buttons
-    chat_mode_keys = list(config.chat_modes.keys())
-    page_chat_mode_keys = chat_mode_keys[page_index * n_chat_modes_per_page:(page_index + 1) * n_chat_modes_per_page]
+def get_owner_panel_main():
+    total_users = db.get_total_users_count()
+    total_groups = db.get_total_groups_count()
+    total_mems = db.get_total_memories_count()
+    home_id = db.get_global_setting("home_chat_id", "Not set")
+    home_title = db.get_global_setting("home_chat_title", "None")
+    home_auto = db.get_global_setting("home_auto_reply", True)
 
-    keyboard = []
-    for chat_mode_key in page_chat_mode_keys:
-        name = config.chat_modes[chat_mode_key]["name"]
-        keyboard.append([InlineKeyboardButton(name, callback_data=f"set_chat_mode|{chat_mode_key}")])
+    text = (
+        "👑 <b>Owner Control Panel</b>\n\n"
+        f"👥 <b>Users:</b> {total_users}\n"
+        f"👥 <b>Groups:</b> {total_groups}\n"
+        f"🧠 <b>Durable Memories:</b> {total_mems}\n"
+        f"🏠 <b>Home Chat:</b> {html.escape(str(home_title))} (<code>{home_id}</code>)\n"
+        f"⚡ <b>Home Auto-Reply:</b> {'✅ Active' if home_auto else '❌ Mentions Only'}\n"
+        f"🤖 <b>Default Model:</b> <code>{config.default_model}</code>\n"
+    )
 
-    # pagination
-    if len(chat_mode_keys) > n_chat_modes_per_page:
-        is_first_page = (page_index == 0)
-        is_last_page = ((page_index + 1) * n_chat_modes_per_page >= len(chat_mode_keys))
-
-        if is_first_page:
-            keyboard.append([
-                InlineKeyboardButton("»", callback_data=f"show_chat_modes|{page_index + 1}")
-            ])
-        elif is_last_page:
-            keyboard.append([
-                InlineKeyboardButton("«", callback_data=f"show_chat_modes|{page_index - 1}"),
-            ])
-        else:
-            keyboard.append([
-                InlineKeyboardButton("«", callback_data=f"show_chat_modes|{page_index - 1}"),
-                InlineKeyboardButton("»", callback_data=f"show_chat_modes|{page_index + 1}")
-            ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    return text, reply_markup
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Detailed Stats", callback_data="owner_panel|stats"),
+            InlineKeyboardButton("🏠 Home Chat", callback_data="owner_panel|home")
+        ],
+        [
+            InlineKeyboardButton("🤖 Switch Model", callback_data="owner_panel|models"),
+            InlineKeyboardButton("📢 Broadcast", callback_data="owner_panel|broadcast_info")
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="owner_panel|main")
+        ]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
 
 
-async def show_chat_modes_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
+async def panel_command_handle(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Access denied. Only the owner can access the control panel.")
+        return
 
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("🔒 The control panel can only be accessed in private DMs with the bot.")
+        return
 
-    text, reply_markup = get_chat_mode_menu(0)
+    text, reply_markup = get_owner_panel_main()
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
 
 
-async def show_chat_modes_callback_handle(update: Update, context: CallbackContext):
-     await register_user_if_not_exists(update.callback_query, context, update.callback_query.from_user)
-     if await is_previous_message_not_answered_yet(update.callback_query, context): return
-
-     user_id = update.callback_query.from_user.id
-     db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-     query = update.callback_query
-     await query.answer()
-
-     page_index = int(query.data.split("|")[1])
-     if page_index < 0:
-         return
-
-     text, reply_markup = get_chat_mode_menu(page_index)
-     try:
-         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-     except telegram.error.BadRequest as e:
-         if str(e).startswith("Message is not modified"):
-             pass
-
-
-async def set_chat_mode_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update.callback_query, context, update.callback_query.from_user)
-    user_id = update.callback_query.from_user.id
-
+async def owner_panel_callback_handle(update: Update, context: CallbackContext):
     query = update.callback_query
+    user = query.from_user
+    if not is_owner(user.id):
+        await query.answer("⛔ Access denied.", show_alert=True)
+        return
+
     await query.answer()
+    action = query.data.split("|")[1]
 
-    chat_mode = query.data.split("|")[1]
+    if action == "main":
+        text, reply_markup = get_owner_panel_main()
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
 
-    db.set_user_attribute(user_id, "current_chat_mode", chat_mode)
-    db.start_new_dialog(user_id)
+    elif action == "stats":
+        total_users = db.get_total_users_count()
+        total_groups = db.get_total_groups_count()
+        total_mems = db.get_total_memories_count()
 
-    await context.bot.send_message(
-        update.callback_query.message.chat.id,
-        f"{config.chat_modes[chat_mode]['welcome_message']}",
+        text = (
+            "📊 <b>Detailed Bot Statistics</b>\n\n"
+            f"• Registered Users: <b>{total_users}</b>\n"
+            f"• Groups Connected: <b>{total_groups}</b>\n"
+            f"• Stored Long-Term Memories: <b>{total_mems}</b>\n"
+            f"• Active Model: <code>{config.default_model}</code>\n"
+            f"• Memory Weight Semantic: <code>{config.memory_weight_semantic}</code>\n"
+            f"• Memory Weight Importance: <code>{config.memory_weight_importance}</code>\n"
+        )
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="owner_panel|main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+
+    elif action == "home":
+        home_id = db.get_global_setting("home_chat_id", None)
+        home_title = db.get_global_setting("home_chat_title", "None")
+        home_auto = db.get_global_setting("home_auto_reply", True)
+
+        text = (
+            "🏠 <b>Home Chat Settings</b>\n\n"
+            f"Current Home Chat: <b>{html.escape(str(home_title))}</b>\n"
+            f"Chat ID: <code>{home_id or 'Not set'}</code>\n"
+            f"Mode: <b>{'All Messages' if home_auto else 'Mentions & Replies Only'}</b>\n\n"
+            "<i>To set a new home group, open that group and send /sethome.</i>"
+        )
+        toggle_label = "Switch to Mentions Only" if home_auto else "Switch to All Messages"
+        keyboard = [
+            [InlineKeyboardButton(toggle_label, callback_data="owner_panel|toggle_home_auto")],
+            [InlineKeyboardButton("❌ Clear Home Chat", callback_data="owner_panel|clear_home")],
+            [InlineKeyboardButton("« Back", callback_data="owner_panel|main")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+
+    elif action == "toggle_home_auto":
+        cur = db.get_global_setting("home_auto_reply", True)
+        db.set_global_setting("home_auto_reply", not cur)
+        query.data = "owner_panel|home"
+        await owner_panel_callback_handle(update, context)
+
+    elif action == "clear_home":
+        db.set_global_setting("home_chat_id", None)
+        db.set_global_setting("home_chat_title", "None")
+        query.data = "owner_panel|home"
+        await owner_panel_callback_handle(update, context)
+
+    elif action == "models":
+        text = "🤖 <b>Select Global Default Model</b>:"
+        buttons = []
+        for m in config.models.get("available_text_models", []):
+            m_name = config.models["info"].get(m, {}).get("name", m)
+            buttons.append([InlineKeyboardButton(m_name, callback_data=f"owner_panel|set_model|{m}")])
+        buttons.append([InlineKeyboardButton("« Back", callback_data="owner_panel|main")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
+
+    elif action.startswith("set_model"):
+        selected = query.data.split("|")[2]
+        config.default_model = selected
+        text, reply_markup = get_owner_panel_main()
+        await query.edit_message_text(
+            f"✅ <b>Default model switched to:</b> <code>{selected}</code>\n\n" + text,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML
+        )
+
+    elif action == "broadcast_info":
+        text = "📢 <b>Broadcast Announcement</b>\n\nSend to all users and groups via:\n<code>/broadcast Your message text here</code>"
+        keyboard = [[InlineKeyboardButton("« Back", callback_data="owner_panel|main")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+
+
+async def broadcast_handle(update: Update, context: CallbackContext):
+    user = update.effective_user
+    if not is_owner(user.id):
+        await update.message.reply_text("⛔ Only the owner can send broadcasts.")
+        return
+
+    broadcast_text = " ".join(context.args) if context.args else ""
+    if not broadcast_text:
+        await update.message.reply_text("Usage: <code>/broadcast Your message here</code>", parse_mode=ParseMode.HTML)
+        return
+
+    all_user_ids = db.get_all_user_ids()
+    all_chats = [c["_id"] for c in db.get_all_chats() if c["_id"] < 0]
+    targets = list(set(all_user_ids + all_chats))
+
+    status_msg = await update.message.reply_text(f"🚀 Broadcasting to {len(targets)} recipients…")
+    success = 0
+    failed = 0
+
+    for target_id in targets:
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=f"📢 <b>Announcement:</b>\n\n{broadcast_text}",
+                parse_mode=ParseMode.HTML
+            )
+            success += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>Broadcast Complete!</b>\n\n"
+        f"• Delivered: <b>{success}</b>\n"
+        f"• Failed/Blocked: <b>{failed}</b>",
         parse_mode=ParseMode.HTML
     )
 
 
-def get_settings_menu(user_id: int):
-    current_model = db.get_user_attribute(user_id, "current_model")
-    text = config.models["info"][current_model]["description"]
+async def error_handle(update: Update, context: CallbackContext):
+    logger.error("Exception handling update:", exc_info=context.error)
 
-    text += "\n\n"
-    score_dict = config.models["info"][current_model]["scores"]
-    for score_key, score_value in score_dict.items():
-        text += "🟢" * score_value + "⚪️" * (5 - score_value) + f" – {score_key}\n\n"
-
-    text += "\nSelect <b>model</b>:"
-
-    # buttons to choose models (chunked into rows of 2 to stay within
-    # Telegram's per-row button limit as the model list grows)
-    buttons = []
-    for model_key in config.models["available_text_models"]:
-        title = config.models["info"][model_key]["name"]
-        if model_key == current_model:
-            title = "✅ " + title
-
-        buttons.append(
-            InlineKeyboardButton(title, callback_data=f"set_settings|{model_key}")
-        )
-
-    keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    return text, reply_markup
-
-
-async def settings_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
-
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-    text, reply_markup = get_settings_menu(user_id)
-    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-
-
-async def set_settings_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update.callback_query, context, update.callback_query.from_user)
-    user_id = update.callback_query.from_user.id
-
-    query = update.callback_query
-    await query.answer()
-
-    _, model_key = query.data.split("|")
-    db.set_user_attribute(user_id, "current_model", model_key)
-    db.start_new_dialog(user_id)
-
-    text, reply_markup = get_settings_menu(user_id)
-    try:
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-    except telegram.error.BadRequest as e:
-        if str(e).startswith("Message is not modified"):
-            pass
-
-
-async def show_balance_handle(update: Update, context: CallbackContext):
-    await register_user_if_not_exists(update, context, update.message.from_user)
-
-    user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-
-    # count total usage statistics
-    total_n_spent_dollars = 0
-    total_n_used_tokens = 0
-
-    n_used_tokens_dict = db.get_user_attribute(user_id, "n_used_tokens")
-    n_generated_images = db.get_user_attribute(user_id, "n_generated_images")
-    n_transcribed_seconds = db.get_user_attribute(user_id, "n_transcribed_seconds")
-
-    details_text = "🏷️ Details:\n"
-    for model_key in sorted(n_used_tokens_dict.keys()):
-        # skip models that are no longer configured (e.g. removed legacy models
-        # a user spent tokens on in the past) to avoid a KeyError
-        if model_key not in config.models["info"]:
-            continue
-
-        n_input_tokens, n_output_tokens = n_used_tokens_dict[model_key]["n_input_tokens"], n_used_tokens_dict[model_key]["n_output_tokens"]
-        total_n_used_tokens += n_input_tokens + n_output_tokens
-
-        n_input_spent_dollars = config.models["info"][model_key]["price_per_1000_input_tokens"] * (n_input_tokens / 1000)
-        n_output_spent_dollars = config.models["info"][model_key]["price_per_1000_output_tokens"] * (n_output_tokens / 1000)
-        total_n_spent_dollars += n_input_spent_dollars + n_output_spent_dollars
-
-        details_text += f"- {model_key}: <b>{n_input_spent_dollars + n_output_spent_dollars:.03f}$</b> / <b>{n_input_tokens + n_output_tokens} tokens</b>\n"
-
-    # image generation
-    image_generation_n_spent_dollars = config.models["info"]["gpt-image-1"]["price_per_1_image"] * n_generated_images
-    if n_generated_images != 0:
-        details_text += f"- GPT Image (image generation): <b>{image_generation_n_spent_dollars:.03f}$</b> / <b>{n_generated_images} generated images</b>\n"
-
-    total_n_spent_dollars += image_generation_n_spent_dollars
-
-    # voice recognition
-    voice_recognition_n_spent_dollars = config.models["info"]["whisper"]["price_per_1_min"] * (n_transcribed_seconds / 60)
-    if n_transcribed_seconds != 0:
-        details_text += f"- Whisper (voice recognition): <b>{voice_recognition_n_spent_dollars:.03f}$</b> / <b>{n_transcribed_seconds:.01f} seconds</b>\n"
-
-    total_n_spent_dollars += voice_recognition_n_spent_dollars
-
-
-    text = f"You spent <b>{total_n_spent_dollars:.03f}$</b>\n"
-    text += f"You used <b>{total_n_used_tokens}</b> tokens\n\n"
-    text += details_text
-
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-async def edited_message_handle(update: Update, context: CallbackContext):
-    if update.edited_message.chat.type == "private":
-        text = "🥲 Unfortunately, message <b>editing</b> is not supported"
-        await update.edited_message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-async def error_handle(update: Update, context: CallbackContext) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-
-    try:
-        # collect error message
-        tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-        tb_string = "".join(tb_list)
-        update_str = update.to_dict() if isinstance(update, Update) else str(update)
-        message = (
-            f"An exception was raised while handling an update\n"
-            f"<pre>update = {html.escape(json.dumps(update_str, indent=2, ensure_ascii=False))}"
-            "</pre>\n\n"
-            f"<pre>{html.escape(tb_string)}</pre>"
-        )
-
-        # split text into multiple messages due to 4096 character limit
-        for message_chunk in split_text_into_chunks(message, 4096):
-            try:
-                await context.bot.send_message(update.effective_chat.id, message_chunk, parse_mode=ParseMode.HTML)
-            except telegram.error.BadRequest:
-                # answer has invalid characters, so we send it without parse_mode
-                await context.bot.send_message(update.effective_chat.id, message_chunk)
-    except Exception:
-        await context.bot.send_message(update.effective_chat.id, "Some error in error handler")
 
 async def post_init(application: Application):
-    await application.bot.set_my_commands([
-        BotCommand("/new", "Start new dialog"),
-        BotCommand("/mode", "Select chat mode"),
-        BotCommand("/retry", "Re-generate response for previous query"),
-        BotCommand("/balance", "Show balance"),
-        BotCommand("/settings", "Show settings"),
+    commands = [
+        BotCommand("/new", "Start fresh dialog"),
         BotCommand("/help", "Show help message"),
-    ])
+    ]
+    if config.owner_id:
+        commands.append(BotCommand("/panel", "👑 Owner Control Panel"))
+        commands.append(BotCommand("/sethome", "🏠 Set Home Chat"))
+
+    await application.bot.set_my_commands(commands)
+
 
 def run_bot() -> None:
+    if not config.telegram_token:
+        raise ValueError("TELEGRAM_TOKEN is required. Set it in config/config.yml or via environment variable.")
+
     application = (
         ApplicationBuilder()
         .token(config.telegram_token)
@@ -845,41 +840,28 @@ def run_bot() -> None:
         .build()
     )
 
-    # add handlers
-    user_filter = filters.ALL
-    if len(config.allowed_telegram_usernames) > 0:
-        usernames = [x for x in config.allowed_telegram_usernames if isinstance(x, str)]
-        any_ids = [x for x in config.allowed_telegram_usernames if isinstance(x, int)]
-        user_ids = [x for x in any_ids if x > 0]
-        group_ids = [x for x in any_ids if x < 0]
-        user_filter = filters.User(username=usernames) | filters.User(user_id=user_ids) | filters.Chat(chat_id=group_ids)
+    # Core commands
+    application.add_handler(CommandHandler("start", start_handle))
+    application.add_handler(CommandHandler("help", help_handle))
+    application.add_handler(CommandHandler("new", new_dialog_handle))
+    application.add_handler(CommandHandler("cancel", cancel_handle))
 
-    application.add_handler(CommandHandler("start", start_handle, filters=user_filter))
-    application.add_handler(CommandHandler("help", help_handle, filters=user_filter))
-    application.add_handler(CommandHandler("help_group_chat", help_group_chat_handle, filters=user_filter))
+    # Owner commands
+    application.add_handler(CommandHandler("panel", panel_command_handle))
+    application.add_handler(CommandHandler("admin", panel_command_handle))
+    application.add_handler(CommandHandler("sethome", sethome_handle))
+    application.add_handler(CommandHandler("broadcast", broadcast_handle))
+    application.add_handler(CallbackQueryHandler(owner_panel_callback_handle, pattern="^owner_panel"))
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, message_handle))
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & user_filter, message_handle))
-    application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & user_filter, unsupport_message_handle))
-    application.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & user_filter, unsupport_message_handle))
-    application.add_handler(CommandHandler("retry", retry_handle, filters=user_filter))
-    application.add_handler(CommandHandler("new", new_dialog_handle, filters=user_filter))
-    application.add_handler(CommandHandler("cancel", cancel_handle, filters=user_filter))
-
-    application.add_handler(MessageHandler(filters.VOICE & user_filter, voice_message_handle))
-
-    application.add_handler(CommandHandler("mode", show_chat_modes_handle, filters=user_filter))
-    application.add_handler(CallbackQueryHandler(show_chat_modes_callback_handle, pattern="^show_chat_modes"))
-    application.add_handler(CallbackQueryHandler(set_chat_mode_handle, pattern="^set_chat_mode"))
-
-    application.add_handler(CommandHandler("settings", settings_handle, filters=user_filter))
-    application.add_handler(CallbackQueryHandler(set_settings_handle, pattern="^set_settings"))
-
-    application.add_handler(CommandHandler("balance", show_balance_handle, filters=user_filter))
+    # Multimodal Message Handlers
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handle))
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_message_handle))
+    application.add_handler(MessageHandler(filters.VOICE, voice_message_handle))
+    application.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, document_message_handle))
 
     application.add_error_handler(error_handle)
 
-    # start the bot
+    logger.info("Mira-style Personal AI Bot starting up...")
     application.run_polling()
 
 

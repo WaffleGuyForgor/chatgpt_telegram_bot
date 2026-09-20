@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# flush stdout/stderr immediately so logs show up in `docker logs`
+# flush stdout/stderr immediately so logs show up in docker logs
 ENV PYTHONUNBUFFERED=1
 
 RUN \
@@ -22,5 +22,4 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && rm -r /tmp/requireme
 COPY . /code
 WORKDIR /code
 
-CMD ["bash"]
-
+CMD ["python3", "bot/bot.py"]

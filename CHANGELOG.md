@@ -4,6 +4,60 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0]
+
+### Added
+- **Mira-Style Personal AI Assistant Architecture**:
+  - **Natural Language First Controls**: Persistent memory operations without requiring rigid slash commands. Supports natural statements:
+    - *"Remember that [fact/preference]"* — extracts and stores durable context.
+    - *"What do you remember about me?"* — surfaces human-readable memory summary.
+    - *"Forget [topic/fact]"* — selectively removes memories.
+    - *"Don't remember this"* / *"Off the record"* — conversation turn bypasses long-term memory extraction.
+    - *"Stop remembering things"* / *"Resume memory"* — enables or pauses memory learning.
+  - **Structured Long-Term Memory Engine (`bot/memory.py`)**:
+    - Multi-category schema: `identity`, `preference`, `project`, `entity`, `decision`, `personal`, `topic`.
+    - Automated conflict resolution: updates contradicting memories (e.g. upgraded OS, switched preferences) instead of maintaining conflicting truths.
+    - Configurable weighted retrieval scoring:
+      `score = (0.45 * semantic) + (0.20 * importance) + (0.15 * recency) + (0.20 * entity_match)`.
+    - Strict anti-prompt-injection isolation delimiters (`<relevant_memory>`) with instructions treating memories strictly as contextual reference data, not executable instructions.
+  - **Rolling Conversation Summaries (`bot/context_engine.py`)**:
+    - Dynamic summarization of older conversation turns when dialog history exceeds thresholds, retaining recent context and preventing context-window overflow.
+  - **Group Conversation Engine (`bot/group_engine.py`)**:
+    - Speaker tracking with `[Sender Name]: message` formatting and reply relationship preservation.
+    - Natural *"What did I miss?"* / *"What did we decide?"* group catch-up digests summarizing recent decisions, topics, and action items.
+    - Strict context isolation: group memories are scoped to `group:{chat_id}` and never leak into private user memories or vice versa.
+    - `/sethome` command to designate a Home Chat with optional active auto-reply mode.
+  - **Multimodal Ingestion Pipeline (`bot/multimodal.py`)**:
+    - Voice message handling with Whisper transcription piped directly into conversational context.
+    - Vision and image handling with base64 conversion and conversational state preservation for natural follow-up modifications (*"make it darker"*, *"what is in the top right?"*).
+    - Document parsing for PDF files (via `pypdf`), text files, Markdown, JSON, CSV, and source code files.
+  - **Personality & Silent Style Adaptation (`bot/personality.py`)**:
+    - Direct, natural, human-like responses without corporate boilerplate, self-introductions, or *"As an AI assistant..."* disclaimers.
+    - Dynamic silent adaptation to user preferences (verbosity, formality, technical depth).
+  - **Owner Control Panel (`bot/bot.py`)**:
+    - Interactive inline dashboard in private DMs (`/panel`, `/admin`, `/owner`) for owner ID `6274319204`.
+    - Real-time bot analytics (users, groups, dialogs, durable memories).
+    - Home chat manager with auto-reply toggling.
+    - Global model switching on the fly.
+    - Broadcast announcement tool (`/broadcast <message>`) to all registered users and groups with delivery counters.
+  - **Railway Deployment Infrastructure**:
+    - `railway.json` and `Procfile` configuration.
+    - Multi-variable MongoDB connection fallback (`MONGODB_URI`, `MONGO_URL`, `MONGO_PRIVATE_URL`, `DATABASE_URL`).
+    - Standardized production container entrypoint in `Dockerfile`.
+  - Comprehensive unit test suite (`tests/test_mira_assistant.py`) for intent detection, memory scoring, style adaptation, group digests, and message chunking.
+
+### Changed
+- Default model updated to `nex-agi/nex-n2.5-pro:free` routed via OpenRouter.
+- Unified OpenRouter / 9Router / OpenAI-compatible API gateway client with exponential backoff retries.
+- Re-architected message dispatch to support asynchronous, non-blocking background workers for memory extraction and summarization.
+- Response streaming now uses adaptive throttling to respect Telegram rate limits while editing messages in real time.
+- Long response splitting gracefully partitions responses exceeding 4,000 characters along paragraph and newline boundaries without truncating code blocks.
+- Improved error handling to provide friendly, conversational error notices instead of dumping technical stack traces to users.
+
+### Security
+- Verified zero API keys, tokens, or credentials in tracked git files.
+- Strengthened `.gitignore` to strictly exclude `config/config.yml`, `config/config.env`, `.env`, `node_modules/`, and Railway configuration caches.
+
 ## [1.3.1]
 
 ### Fixed
