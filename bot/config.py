@@ -78,6 +78,12 @@ llm_base_url = _get("llm_base_url") or "https://api.groq.com/openai/v1"
 
 import logging as _cfg_log
 _cfg_log.getLogger(__name__).info(f"LLM API keys loaded: {len(llm_api_keys)} key(s) for {llm_base_url}")
+if llm_api_keys:
+    for _i, _k in enumerate(llm_api_keys):
+        _masked = _k[:8] + "..." + _k[-4:] if len(_k) > 12 else "???"
+        _cfg_log.getLogger(__name__).info(f"  Key #{_i}: {_masked} (len={len(_k)}, starts_with={_k[:3]})")
+else:
+    _cfg_log.getLogger(__name__).warning("NO API KEYS LOADED! Check GROQ_API_KEY or LLM_API_KEY env var.")
 
 # Bot owner ID (full control panel in DMs)
 owner_id = _get("owner_id", 6274319204)
