@@ -22,6 +22,14 @@ groq_api_key: ""
 # Default model
 default_model: "openai/gpt-oss-20b"
 
+# Optional: task-based model routing (disabled by default; explicit /model choice always wins)
+# routing_enabled: false
+# routing_fast_model: "nex-agi/nex-n2.5-mini:free"   # serves tiny/short requests
+# routing_deep_model: "openai/gpt-oss-120b"          # serves detailed/deep requests
+
+# Optional: fallback chain tried in order when the primary model's provider fails
+# fallback_models: "nex-agi/nex-n2.5-pro:free,openai/gpt-oss-20b"
+
 # Bot Owner Telegram user ID (enables /panel, /sethome, /broadcast)
 owner_id: 6274319204
 

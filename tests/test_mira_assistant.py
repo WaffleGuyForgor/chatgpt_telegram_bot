@@ -15,6 +15,7 @@ from bot.bot import split_text_into_chunks
 import bot.config as bot_config
 from bot import openai_utils
 from bot import response_tuning
+from bot import bot as bot_module
 
 
 class DummyDatabase:
@@ -68,6 +69,26 @@ class DummyDatabase:
 
     def set_conversational_state(self, entity_id, data):
         self.states[entity_id] = data
+
+    def reinforce_memory(self, memory_id, boost=0.1):
+        for m in self.memories:
+            if m["_id"] == memory_id:
+                m["confidence"] = min(1.0, m.get("confidence", 0.9) + boost)
+                m["usage_count"] = m.get("usage_count", 0) + 1
+                m["last_confirmed_at"] = datetime.now()
+
+    def weaken_memory(self, memory_id, penalty=0.2):
+        for m in self.memories:
+            if m["_id"] == memory_id:
+                m["confidence"] = max(0.1, m.get("confidence", 0.9) - penalty)
+
+    def set_chat_attribute(self, chat_id, key, value):
+        if chat_id not in self.chats:
+            self.chats[chat_id] = {}
+        self.chats[chat_id][key] = value
+
+    def get_chat_attribute(self, chat_id, key, default=None):
+        return self.chats.get(chat_id, {}).get(key, default)
 
     def get_group_message_buffer(self, chat_id):
         return [
@@ -240,6 +261,132 @@ class TestResponseTuning(unittest.TestCase):
             msg = response_tuning.pick_status_message(size)
             self.assertIsInstance(msg, str)
             self.assertTrue(msg.endswith("…"))
+
+
+class TestScopedPreferences(unittest.TestCase):
+    """Stage 2: global vs per-conversation preferences and preference explanation."""
+
+    def setUp(self):
+        self.db = DummyDatabase()
+        self.personality = PersonalityEngine(self.db)
+
+    def test_reaction_scopes_to_conversation(self):
+        self.personality.adapt_user_style_from_message(1, "that was too long")
+        self.assertEqual(self.db.states[1]["style_override"]["verbosity"], "low")
+        self.assertIsNone(self.db.users.get(1), "one-off feedback must not become a global preference")
+
+    def test_stated_preference_goes_global(self):
+        self.personality.adapt_user_style_from_message(1, "from now on keep it short")
+        self.assertEqual(self.db.users[1]["style_preferences"]["verbosity"], "low")
+        self.assertEqual(self.db.states, {})
+
+    def test_conversational_marker_scopes_to_chat(self):
+        self.personality.adapt_user_style_from_message(5, "for this chat be detailed", entity_id=5)
+        self.assertEqual(self.db.states[5]["style_override"]["verbosity"], "detailed")
+        self.assertIsNone(self.db.users.get(5))
+
+    def test_no_emojis_preference_reaches_prompt(self):
+        self.personality.adapt_user_style_from_message(1, "from now on don't use emojis")
+        self.assertFalse(self.db.users[1]["style_preferences"]["emojis"])
+        self.assertIn("Do not use emojis", self.personality.get_system_prompt(1))
+
+    def test_conversation_override_beats_global(self):
+        self.db.set_user_attribute(1, "style_preferences", {"verbosity": "detailed"})
+        self.db.set_conversational_state(1, {"style_override": {"verbosity": "low"}})
+        prompt = self.personality.get_system_prompt(1)
+        self.assertIn("concise", prompt)
+        self.assertNotIn("thorough, detailed explanations", prompt)
+
+    def test_explain_response_style(self):
+        self.db.set_conversational_state(1, {"style_override": {"verbosity": "low"}})
+        self.assertIn("brief", self.personality.explain_response_style(1, 1))
+        self.assertIsNone(self.personality.explain_response_style(2, 2))
+
+
+class TestMemoryLifecycle(unittest.IsolatedAsyncioTestCase):
+    """Stage 2: confidence-weighted retrieval and reinforcement."""
+
+    async def test_confidence_weighting_in_retrieval(self):
+        db = DummyDatabase()
+        engine = MemoryEngine(db)
+        scope, eid = "user:7", 7
+        db.add_memory(scope, eid, "User deploys Hermes on Railway", "project", importance=0.5, keywords=["hermes"])
+        db.add_memory(scope, eid, "User deploys Hermes on Fly.io", "project", importance=0.5, keywords=["hermes"])
+        db.memories[0]["confidence"] = 1.0
+        db.memories[1]["confidence"] = 0.2
+
+        retrieved = await engine.retrieve_relevant_memories(scope, eid, "hermes deploy", limit=2)
+        self.assertEqual(len(retrieved), 2)
+        self.assertIn("Railway", retrieved[0]["content"], "high-confidence memory should rank first")
+
+    async def test_reinforcement_raises_confidence(self):
+        db = DummyDatabase()
+        mem_id = db.add_memory("user:7", 7, "User prefers concise answers", "preference")
+        before = db.memories[0]["confidence"]
+        db.reinforce_memory(mem_id, boost=0.1)
+        self.assertGreater(db.memories[0]["confidence"], before)
+        self.assertEqual(db.memories[0]["usage_count"], 1)
+
+    def test_low_confidence_memory_flagged_in_prompt(self):
+        db = DummyDatabase()
+        engine = MemoryEngine(db)
+        prompt = engine.format_memory_for_prompt([
+            {"category": "project", "content": "Project Aurora exists", "confidence": 0.3},
+            {"category": "project", "content": "Project Hermes exists", "confidence": 0.95},
+        ])
+        self.assertIn("[PROJECT [low confidence]]", prompt)
+        self.assertIn("[PROJECT]: Project Hermes exists", prompt)
+
+
+class TestModelRouting(unittest.TestCase):
+    """Stage 2: optional task-based routing, fallback chain, latency stats."""
+
+    def setUp(self):
+        self.db = DummyDatabase()
+        self._orig_db = bot_module.db
+        bot_module.db = self.db
+
+    def tearDown(self):
+        bot_module.db = self._orig_db
+
+    def test_routing_disabled_by_default(self):
+        self.assertFalse(bot_config.routing_enabled)
+        self.assertEqual(bot_module.route_model_for_request(42, "detailed"), bot_config.default_model)
+
+    def test_routing_picks_models_by_request_size(self):
+        with unittest.mock.patch.object(bot_config, "routing_enabled", True), \
+             unittest.mock.patch.object(bot_config, "routing_fast_model", "openai/gpt-oss-20b"), \
+             unittest.mock.patch.object(bot_config, "routing_deep_model", "openai/gpt-oss-120b"), \
+             unittest.mock.patch.object(openai_utils, "provider_is_configured", return_value=True):
+            self.assertEqual(bot_module.route_model_for_request(42, "tiny"), "openai/gpt-oss-20b")
+            self.assertEqual(bot_module.route_model_for_request(42, "short"), "openai/gpt-oss-20b")
+            self.assertEqual(bot_module.route_model_for_request(42, "deep"), "openai/gpt-oss-120b")
+            self.assertEqual(bot_module.route_model_for_request(42, "normal"), bot_config.default_model)
+
+    def test_explicit_choice_beats_routing(self):
+        self.db.set_user_attribute(42, "current_model", "nex-agi/nex-n2.5-mini:free")
+        with unittest.mock.patch.object(bot_config, "routing_enabled", True), \
+             unittest.mock.patch.object(bot_config, "routing_fast_model", "openai/gpt-oss-20b"), \
+             unittest.mock.patch.object(openai_utils, "provider_is_configured", return_value=True):
+            self.assertEqual(bot_module.route_model_for_request(42, "tiny"), "nex-agi/nex-n2.5-mini:free")
+
+    def test_fallback_chain_defaults_empty(self):
+        self.assertEqual(bot_config.fallback_models, [])
+
+    def test_candidate_models_includes_fallbacks(self):
+        client = openai_utils.ChatGPT(model="openai/gpt-oss-20b")
+        with unittest.mock.patch.object(bot_config, "fallback_models", ["nex-agi/nex-n2.5-pro:free", "openai/gpt-oss-20b"]):
+            chain = client._candidate_models()
+        self.assertEqual(chain, ["openai/gpt-oss-20b", "nex-agi/nex-n2.5-pro:free"])
+
+    def test_model_stats_roundtrip(self):
+        openai_utils._record_model_call("test/model-x", 1.5, ok=True)
+        openai_utils._record_model_call("test/model-x", 0.5, ok=False, rate_limited=True, error=Exception("429"))
+        stats = openai_utils.get_model_stats()["test/model-x"]
+        self.assertEqual(stats["calls"], 2)
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(stats["rate_limits"], 1)
+        self.assertAlmostEqual(stats["avg_latency"], 1.0, places=2)
 
 
 if __name__ == "__main__":

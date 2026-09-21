@@ -317,6 +317,9 @@ class Database:
             "category": category,
             "importance": float(importance),
             "confidence": float(confidence),
+            "stability": 0.5,  # grows as the fact is repeatedly confirmed over time
+            "usage_count": 0,
+            "last_confirmed_at": datetime.now(),
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
             "last_recalled_at": datetime.now(),
@@ -326,6 +329,41 @@ class Database:
         }
         self.memories_collection.insert_one(doc)
         return mem_id
+
+    def reinforce_memory(self, memory_id: str, boost: float = 0.1):
+        """
+        Reinforces a repeatedly-confirmed memory: raises confidence (capped at 1.0),
+        bumps stability and usage_count, and refreshes last_confirmed_at.
+        Used when the user restates a fact we already know, instead of duplicating it.
+        """
+        doc = self.memories_collection.find_one({"_id": memory_id})
+        if not doc:
+            return
+        new_confidence = min(1.0, float(doc.get("confidence", 0.9)) + boost)
+        new_stability = min(1.0, float(doc.get("stability", 0.5)) + boost / 2)
+        self.memories_collection.update_one(
+            {"_id": memory_id},
+            {
+                "$set": {
+                    "confidence": new_confidence,
+                    "stability": new_stability,
+                    "last_confirmed_at": datetime.now(),
+                    "updated_at": datetime.now()
+                },
+                "$inc": {"usage_count": 1}
+            }
+        )
+
+    def weaken_memory(self, memory_id: str, penalty: float = 0.2):
+        """Lowers confidence when a memory is contradicted but not fully replaced."""
+        doc = self.memories_collection.find_one({"_id": memory_id})
+        if not doc:
+            return
+        new_confidence = max(0.1, float(doc.get("confidence", 0.9)) - penalty)
+        self.memories_collection.update_one(
+            {"_id": memory_id},
+            {"$set": {"confidence": new_confidence, "updated_at": datetime.now()}}
+        )
 
     def get_active_memories(self, scope: str, entity_id: int) -> List[Dict]:
         return list(self.memories_collection.find({

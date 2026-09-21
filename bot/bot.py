@@ -7,6 +7,7 @@ import html
 import json
 import logging
 import asyncio
+import re
 import traceback
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -149,6 +150,39 @@ def resolve_model(entity_id: int) -> str:
             logger.error(f"Failed to persist model reset for {entity_id}: {e}")
 
     return fallback
+
+
+def route_model_for_request(entity_id: int, request_size: str) -> str:
+    """
+    Optional task-based model routing (§26).
+
+    Rules:
+    - Routing is off unless config.routing_enabled is set.
+    - An explicit /model choice always wins (a stored current_model beats routing).
+    - Otherwise: tiny/short -> routing_fast_model, detailed/deep -> routing_deep_model,
+      normal -> default model. Unconfigured/invalid routed models fall back safely.
+    """
+    base = resolve_model(entity_id)
+    if not config.routing_enabled:
+        return base
+
+    # Explicit user/group choice always wins
+    if entity_id > 0:
+        stored = db.get_user_attribute(entity_id, "current_model")
+    else:
+        stored = db.get_chat_attribute(entity_id, "current_model")
+    if stored:
+        return base
+
+    routed = None
+    if request_size in ("tiny", "short") and config.routing_fast_model:
+        routed = config.routing_fast_model
+    elif request_size in ("detailed", "deep") and config.routing_deep_model:
+        routed = config.routing_deep_model
+
+    if routed and openai_utils.provider_is_configured(openai_utils.get_provider_for_model(routed)):
+        return routed
+    return base
 
 
 def is_owner(user_id: int) -> bool:
@@ -312,6 +346,18 @@ async def process_user_turn(
             await update.message.reply_text("Memory resumed! I will remember relevant context from now on.")
         return
 
+    # 1b. "Why did you answer that way?" — natural preference explanation (§14)
+    if re.search(r"\bwhy (did|do) you (answer|respond|reply|say|write|word|phrase)\b", clean_text.lower()):
+        explanation = personality.explain_response_style(user.id if user else 0, entity_id)
+        if explanation:
+            await update.message.reply_text(explanation)
+        else:
+            await update.message.reply_text(
+                "That was just my default style — no special preferences are active right now. "
+                "You can steer me anytime, e.g. \"be more detailed\", \"keep it short for this chat\", or \"no emojis\"."
+            )
+        return
+
     # 2. Natural Group Digest Check ("What did I miss?")
     if is_group and group_engine.is_digest_request(clean_text):
         await update.message.chat.send_action(action=ChatAction.TYPING)
@@ -363,8 +409,14 @@ async def process_user_turn(
         await update.message.reply_text("⏳ Working on your previous request, please wait a moment…", reply_to_message_id=update.message.id)
         return
 
-    current_model = resolve_model(entity_id)
+    current_model = route_model_for_request(entity_id, request_size)
     current_provider = openai_utils.get_provider_for_model(current_model)
+
+    # If a routed model's provider isn't configured, fall back to the default model
+    if not openai_utils.provider_is_configured(current_provider) and current_model != config.default_model:
+        logger.warning(f"Provider '{current_provider}' not configured for model '{current_model}' — using default model")
+        current_model = config.default_model
+        current_provider = openai_utils.get_provider_for_model(current_model)
 
     # Guard: the selected model's provider must have API keys configured
     if not openai_utils.provider_is_configured(current_provider):
@@ -461,6 +513,22 @@ async def process_user_turn(
                         message_id=placeholder.message_id
                     )
 
+            # Fallback notice (§27): tell the user briefly, without infra details
+            if getattr(chatgpt_client, "used_fallback", False):
+                noted = (
+                    answer
+                    + f"\n\n<i>⚡ The primary model was unavailable — this answer came from {html.escape(chatgpt_client.used_model)}.</i>"
+                )
+                try:
+                    await context.bot.edit_message_text(
+                        noted[:4000],
+                        chat_id=placeholder.chat_id,
+                        message_id=placeholder.message_id,
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+
             # Send remaining chunks if response exceeds Telegram 4096 character limit
             if len(answer) > 4000:
                 for chunk in split_text_into_chunks(answer[4000:]):
@@ -476,7 +544,9 @@ async def process_user_turn(
                 "date": datetime.now()
             }
             db.set_dialog_messages(entity_id, db.get_dialog_messages(entity_id) + [turn_record])
-            db.update_n_used_tokens(entity_id, current_model, n_input_tokens, n_output_tokens)
+            # Token usage is attributed to the model that actually answered
+            db.update_n_used_tokens(entity_id, getattr(chatgpt_client, "used_model", current_model),
+                                    n_input_tokens, n_output_tokens)
 
             # Update conversational state for natural follow-ups ("make it shorter", "another version")
             db.set_conversational_state(entity_id, {
@@ -484,9 +554,12 @@ async def process_user_turn(
                 "last_user_query": clean_text
             })
 
-            # Silently adapt user communication style
-            if entity_id > 0:
-                personality.adapt_user_style_from_message(entity_id, clean_text)
+            # Silently adapt user communication style with correct scope (§13/§15)
+            personality.adapt_user_style_from_message(
+                user.id if user else 0,
+                clean_text,
+                entity_id=entity_id
+            )
 
             # Background Tasks: Memory Extraction & Rolling Summarization (Non-blocking!)
             if not is_off_the_record:
@@ -1038,6 +1111,20 @@ async def owner_panel_callback_handle(update: Update, context: CallbackContext):
             f"• Memory Weight Semantic: <code>{config.memory_weight_semantic}</code>\n"
             f"• Memory Weight Importance: <code>{config.memory_weight_importance}</code>\n"
         )
+
+        # Rolling per-model performance (§28)
+        model_stats = openai_utils.get_model_stats()
+        if model_stats:
+            perf_lines = ["\n🤖 <b>Model Performance</b> (calls / errors / rate-limits / avg latency):"]
+            for m, s in sorted(model_stats.items(), key=lambda kv: kv[1]["calls"], reverse=True)[:6]:
+                perf_lines.append(
+                    f"• <code>{html.escape(m)}</code>: {s['calls']} / {s['errors']} / {s['rate_limits']} / {s['avg_latency']}s"
+                )
+            text += "\n".join(perf_lines) + "\n"
+
+        if config.fallback_models:
+            text += f"• Fallback chain: <code>{html.escape(', '.join(config.fallback_models))}</code>\n"
+
         keyboard = [[InlineKeyboardButton("« Back", callback_data="owner_panel|main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
 

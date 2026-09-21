@@ -200,5 +200,32 @@ _cfg_log.getLogger(__name__).info(f"Default model: {default_model}")
 # Background memory extraction & summarization model (falls back to default_model)
 memory_model = _get("memory_model") or default_model
 
+# Optional task-based model routing (§26) — disabled by default.
+# An explicit /model choice always wins over routing; routing only applies
+# to users still on the default model.
+routing_enabled = _get("routing_enabled", False, lambda v: v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes"))
+routing_fast_model = _get("routing_fast_model", "")  # serves tiny/short requests when routing is on
+routing_deep_model = _get("routing_deep_model", "")  # serves detailed/deep requests when routing is on
+for _routed_name, _routed_val in (("routing_fast_model", routing_fast_model), ("routing_deep_model", routing_deep_model)):
+    if _routed_val and _routed_val not in models.get("info", {}):
+        _cfg_log.getLogger(__name__).warning(f"{_routed_name} '{_routed_val}' not in models.yml — ignoring")
+        if _routed_name == "routing_fast_model":
+            routing_fast_model = ""
+        else:
+            routing_deep_model = ""
+
+# Optional fallback chain (§27): ordered list of models tried when the active
+# model's provider fails (rate limits, outages). Empty = no automatic fallback.
+fallback_models = []
+for _fb in _str_list(_get("fallback_models", "")):
+    if not isinstance(_fb, str):
+        continue
+    if _fb in models.get("info", {}):
+        fallback_models.append(_fb)
+    else:
+        _cfg_log.getLogger(__name__).warning(f"Fallback model '{_fb}' not in models.yml — ignoring")
+if fallback_models:
+    _cfg_log.getLogger(__name__).info(f"Fallback chain: {fallback_models}")
+
 # files
 help_group_chat_video_path = Path(__file__).parent.parent.resolve() / "static" / "help_group_chat.mp4"

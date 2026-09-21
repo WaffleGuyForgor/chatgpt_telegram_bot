@@ -143,6 +143,34 @@ def get_provider_stats() -> Dict[str, Dict]:
         stats[name] = s
     return stats
 
+
+# ---------------- Model performance stats (§28) ----------------
+_model_stats: Dict[str, Dict] = {}
+
+
+def _record_model_call(model: str, latency: float, ok: bool, rate_limited: bool = False, error: Optional[Exception] = None):
+    s = _model_stats.setdefault(model, {
+        "calls": 0, "errors": 0, "rate_limits": 0, "total_latency": 0.0, "last_error": None
+    })
+    s["calls"] += 1
+    s["total_latency"] += latency
+    if rate_limited:
+        s["rate_limits"] += 1
+    if not ok:
+        s["errors"] += 1
+        s["last_error"] = str(error)[:200] if error else None
+
+
+def get_model_stats() -> Dict[str, Dict]:
+    """Rolling per-model performance: calls, errors, rate limits, average latency."""
+    out = {}
+    for model, s in _model_stats.items():
+        out[model] = {
+            **s,
+            "avg_latency": round(s["total_latency"] / s["calls"], 2) if s["calls"] else 0.0,
+        }
+    return out
+
 # Embedding client (single key)
 embedding_client = AsyncOpenAI(
     api_key=config.embedding_api_key,
@@ -169,6 +197,16 @@ class ChatGPT:
     def __init__(self, model: Optional[str] = None):
         self.model = model or config.default_model
         self.provider = get_provider_for_model(self.model)
+        self.used_model = self.model      # actual model that answered (differs if fallback engaged)
+        self.used_fallback = False
+
+    def _candidate_models(self) -> List[str]:
+        """Primary model + configured fallback chain (§27), deduplicated."""
+        chain = [self.model]
+        for m in config.fallback_models:
+            if m != self.model and m not in chain:
+                chain.append(m)
+        return chain
 
     async def send_message(
         self,
@@ -176,22 +214,48 @@ class ChatGPT:
         temperature: float = 0.7,
         max_tokens: int = 1200
     ) -> Tuple[str, Tuple[int, int]]:
-        """Sends messages to the LLM with automatic key rotation on rate limits.
+        """Sends messages to the LLM with key rotation + optional fallback chain (§27).
 
-        Uses the key pool of the provider that serves `self.model`
-        (Groq / OpenRouter / Dahl — see models.yml `provider:`).
+        Tries the primary model first; if its provider pool is exhausted and
+        config.fallback_models is set, walks the chain (each with its own
+        provider pool). Sets self.used_fallback / self.used_model accordingly.
         """
         options = dict(DEFAULT_COMPLETION_OPTIONS)
         options["temperature"] = temperature
         options["max_tokens"] = max_tokens
 
-        pool = get_pool_for_model(self.model)
+        last_error = None
+        for model in self._candidate_models():
+            try:
+                answer, tokens = await self._send_with_model(model, messages, options)
+                if model != self.model:
+                    self.used_fallback = True
+                    self.used_model = model
+                    logger.warning(f"Fallback engaged: '{self.model}' -> '{model}'")
+                return answer, tokens
+            except BadRequestError:
+                raise  # request-shaped problem (e.g. context length) — other models won't help
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Model '{model}' failed: {e}. Trying next in chain…")
+                continue
+        raise last_error or Exception("All models in the fallback chain are unavailable")
+
+    async def _send_with_model(
+        self,
+        model: str,
+        messages: List[Dict],
+        options: Dict
+    ) -> Tuple[str, Tuple[int, int]]:
+        """Single-model completion with key rotation across that model's provider pool."""
+        pool = get_pool_for_model(model)
         last_error = None
         for attempt in range(pool.num_keys + 1):
             client, key_idx = pool._get_next_client()
+            start = time.time()
             try:
                 r = await client.chat.completions.create(
-                    model=self.model,
+                    model=model,
                     messages=messages,
                     **options
                 )
@@ -199,29 +263,34 @@ class ChatGPT:
                 usage = getattr(r, "usage", None)
                 n_in = usage.prompt_tokens if usage else 0
                 n_out = usage.completion_tokens if usage else 0
+                _record_model_call(model, time.time() - start, ok=True)
                 return answer, (n_in, n_out)
             except RateLimitError as e:
                 pool.mark_rate_limited(key_idx)
+                _record_model_call(model, time.time() - start, ok=False, rate_limited=True, error=e)
                 last_error = e
-                logger.warning(f"Rate limit on {self.provider} key #{key_idx} (attempt {attempt + 1}), rotating...")
+                logger.warning(f"Rate limit on {get_provider_for_model(model)} key #{key_idx} (attempt {attempt + 1}), rotating...")
                 await asyncio.sleep(1.0)
                 continue
             except (AuthenticationError, NotFoundError, PermissionDeniedError) as e:
-                logger.error(f"Non-retryable error on key #{key_idx}: {e}")
+                _record_model_call(model, time.time() - start, ok=False, error=e)
+                logger.error(f"Non-retryable error for model '{model}' on key #{key_idx}: {e}")
                 raise
             except BadRequestError as e:
+                _record_model_call(model, time.time() - start, ok=False, error=e)
                 if "context_length" in str(e).lower():
                     raise
                 last_error = e
                 await asyncio.sleep(0.5)
                 continue
             except Exception as e:
+                _record_model_call(model, time.time() - start, ok=False, error=e)
                 last_error = e
-                logger.error(f"API error on key #{key_idx}: {e}")
+                logger.error(f"API error for model '{model}' on key #{key_idx}: {e}")
                 await asyncio.sleep(1.0)
                 continue
 
-        raise last_error or Exception("All API keys exhausted")
+        raise last_error or Exception(f"All API keys exhausted for model '{model}'")
 
     async def send_message_stream(
         self,
@@ -229,19 +298,45 @@ class ChatGPT:
         temperature: float = 0.7,
         max_tokens: int = 1200
     ) -> AsyncGenerator[Tuple[str, str, Tuple[int, int]], None]:
-        """Streams completion tokens with key rotation across the model's provider pool."""
+        """Streams completion tokens with key rotation + optional fallback chain (§27)."""
         options = dict(DEFAULT_COMPLETION_OPTIONS)
         options["temperature"] = temperature
         options["max_tokens"] = max_tokens
         options["stream"] = True
 
-        pool = get_pool_for_model(self.model)
+        last_error = None
+        for model in self._candidate_models():
+            try:
+                async for item in self._stream_with_model(model, messages, options):
+                    yield item
+                if model != self.model:
+                    self.used_fallback = True
+                    self.used_model = model
+                    logger.warning(f"Streaming fallback engaged: '{self.model}' -> '{model}'")
+                return
+            except BadRequestError:
+                raise  # request-shaped problem — other models won't help
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Streaming with model '{model}' failed: {e}. Trying next in chain…")
+                continue
+        raise last_error or Exception("All models in the fallback chain are unavailable during streaming")
+
+    async def _stream_with_model(
+        self,
+        model: str,
+        messages: List[Dict],
+        options: Dict
+    ) -> AsyncGenerator[Tuple[str, str, Tuple[int, int]], None]:
+        """Single-model streaming with key rotation across that model's provider pool."""
+        pool = get_pool_for_model(model)
         last_error = None
         for attempt in range(pool.num_keys + 1):
             client, key_idx = pool._get_next_client()
+            start = time.time()
             try:
                 r_gen = await client.chat.completions.create(
-                    model=self.model,
+                    model=model,
                     messages=messages,
                     **options
                 )
@@ -257,30 +352,34 @@ class ChatGPT:
                     if content:
                         answer += content
                         n_input_tokens, n_output_tokens = self._count_tokens_from_messages(
-                            messages, answer, model=self.model
+                            messages, answer, model=model
                         )
                         yield "not_finished", answer, (n_input_tokens, n_output_tokens)
 
+                _record_model_call(model, time.time() - start, ok=True)
                 yield "finished", answer.strip(), (n_input_tokens, n_output_tokens)
                 return  # success, exit retry loop
 
             except RateLimitError as e:
                 pool.mark_rate_limited(key_idx)
+                _record_model_call(model, time.time() - start, ok=False, rate_limited=True, error=e)
                 last_error = e
-                logger.warning(f"Rate limit on {self.provider} key #{key_idx} during streaming, rotating...")
+                logger.warning(f"Rate limit on {get_provider_for_model(model)} key #{key_idx} during streaming, rotating...")
                 await asyncio.sleep(1.0)
                 continue
             except (AuthenticationError, NotFoundError, PermissionDeniedError) as e:
                 # Rotating keys won't help — the key is bad or the model doesn't exist.
-                logger.error(f"Non-retryable error on key #{key_idx}: {e}")
+                _record_model_call(model, time.time() - start, ok=False, error=e)
+                logger.error(f"Non-retryable error for model '{model}' on key #{key_idx}: {e}")
                 raise
             except Exception as e:
+                _record_model_call(model, time.time() - start, ok=False, error=e)
                 last_error = e
-                logger.error(f"Streaming error on key #{key_idx}: {e}")
+                logger.error(f"Streaming error for model '{model}' on key #{key_idx}: {e}")
                 await asyncio.sleep(1.0)
                 continue
 
-        raise last_error or Exception("All API keys exhausted during streaming")
+        raise last_error or Exception(f"All API keys exhausted during streaming for model '{model}'")
 
     def _count_tokens_from_messages(self, messages: List[Dict], answer: str, model: str = "") -> Tuple[int, int]:
         try:

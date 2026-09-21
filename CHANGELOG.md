@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Phase 2 Polish, Stage 2 (memory lifecycle, scoped preferences, routing)
+- **Memory lifecycle metadata** (`bot/database.py`): memories now carry `confidence`, `stability`, `usage_count`, `last_confirmed_at` alongside importance/recency, plus `reinforce_memory()` (raise confidence, capped at 1.0) and `weaken_memory()` for contradictions.
+- **Memory reinforcement**: when the user restates something already known, the existing memory is reinforced (confidence/usage grow) instead of being duplicated.
+- **Confidence-aware retrieval & answers**: retrieval scores are dampened by confidence, and low-confidence memories are marked `[low confidence]` in the prompt with an instruction to hedge rather than state them as fact.
+- **Correction-aware extraction**: the memory extractor now prefers updating an existing memory over adding a new one when the user corrects a fact, keeping corrections scoped (e.g. a project correction updates the project memory, not the user's global preferences) and ignoring momentary emotional reactions.
+- **Global vs per-conversation preferences** (`bot/personality.py`): stated preferences ("from now on keep it short") update the durable user profile, while one-off reactions ("too long", "don't talk like that", "for this chat be detailed") are scoped to the current conversation and merged with lowest priority below explicit per-message instructions. New "no emojis" preference is honored in the prompt.
+- **Preference explanation**: "why did you answer that way?" gets a natural, non-technical explanation of the active preferences (§14).
+- **Optional task-based model routing** (`ROUTING_ENABLED`, `ROUTING_FAST_MODEL`, `ROUTING_DEEP_MODEL`): routes tiny/short requests to a fast model and detailed/deep requests to a stronger one — disabled by default, and an explicit `/model` choice always wins. Unconfigured providers fall back to the default model safely.
+- **Optional fallback chain** (`FALLBACK_MODELS`, comma-separated): if the active model's provider is exhausted or failing, the next configured model is tried automatically (each with its own provider key pool). The user gets a brief notice that a fallback answered; token accounting is attributed to the model that actually answered.
+- **Rolling model performance stats** (calls / errors / rate limits / average latency) recorded per model and shown in the owner panel's detailed stats, along with the active fallback chain.
+- New tests for scoped preferences, memory reinforcement/confidence ranking, routing precedence, fallback chain order, and stats accounting.
+
 ### Added — Phase 2 Polish, Stage 1 (fast UX, adaptive length, natural tone)
 - **Intelligent response length** (`bot/response_tuning.py`): every request is classified as `tiny` / `short` / `normal` / `detailed` / `deep`, which drives the `max_tokens` budget (150 → 4000) and a per-turn length instruction in the system prompt. Explicit user control (*"in one sentence"*, *"detailed explanation"*, *"comprehensive guide"*) always overrides the heuristics.
 - **Soft mood adaptation**: each message gets an ephemeral tone signal (`joking` / `frustrated` / `technical` / `casual` / `serious` / `neutral`) injected as an explicitly-marked soft guess — never stored, never treated as fact.
