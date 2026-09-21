@@ -56,16 +56,15 @@ def _str_list(value):
 # config parameters
 telegram_token = _get("telegram_token", "")
 
-# LLM Gateway credentials (OpenRouter / 9Router / OpenAI-compatible)
+# LLM Gateway credentials (Groq default, OpenRouter fallback)
+groq_api_key = _get("groq_api_key", None)
 openrouter_api_key = _get("openrouter_api_key", None)
-openrouter_api_base = _get("openrouter_api_base", "https://openrouter.ai/api/v1")
 openai_api_key = _get("openai_api_key", None)
-openai_api_base = _get("openai_api_base", None)
 
 # Unified LLM provider settings
-# Support multiple API keys for load spreading: LLM_API_KEYS=sk-abc,sk-def,sk-ghi
-# Falls back to single key: LLM_API_KEY or OPENROUTER_API_KEY
-_single_key = _get("llm_api_key") or openrouter_api_key or openai_api_key or ""
+# Priority: LLM_API_KEY > GROQ_API_KEY > OPENROUTER_API_KEY > OPENAI_API_KEY
+# Supports multiple keys for load spreading: LLM_API_KEYS=sk-abc,sk-def,sk-ghi
+_single_key = _get("llm_api_key") or groq_api_key or openrouter_api_key or openai_api_key or ""
 _multi_keys_raw = _get("llm_api_keys") or ""  # comma-separated
 
 if _multi_keys_raw:
@@ -75,7 +74,7 @@ else:
 
 # Keep single key for backward compat
 llm_api_key = _single_key
-llm_base_url = _get("llm_base_url") or openrouter_api_base or openai_api_base or "https://openrouter.ai/api/v1"
+llm_base_url = _get("llm_base_url") or "https://api.groq.com/openai/v1"
 
 import logging as _cfg_log
 _cfg_log.getLogger(__name__).info(f"LLM API keys loaded: {len(llm_api_keys)} key(s) for {llm_base_url}")

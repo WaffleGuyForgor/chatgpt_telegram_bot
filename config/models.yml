@@ -1,24 +1,33 @@
-available_text_models: ["nex-agi/nex-n2.5-pro:free"]
+available_text_models: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 info:
-  nex-agi/nex-n2.5-pro:free:
+  llama-3.3-70b-versatile:
     type: chat_completion
-    provider: openrouter
     vision: false
-    name: Nex N2.5 Pro
-    description: Nex AGI's N2.5 Pro model routed via <b>OpenRouter</b>. Free tier, great for general chat and group conversations.
+    name: Llama 3.3 70B
+    description: Meta's Llama 3.3 70B — highly capable, 131K context, runs on Groq's fast inference engine. Best for complex reasoning and detailed tasks.
 
     price_per_1000_input_tokens: 0.0
     price_per_1000_output_tokens: 0.0
 
     scores:
-      Smart: 4
+      Smart: 5
       Fast: 4
       Cheap: 5
 
-  gpt-image-1:
-     type: image
-     price_per_1_image: 0.042
+  llama-3.1-8b-instant:
+    type: chat_completion
+    vision: false
+    name: Llama 3.1 8B Instant
+    description: Meta's Llama 3.1 8B — ultra-fast (560 t/s), 131K context. Great for quick responses and simple tasks.
+
+    price_per_1000_input_tokens: 0.0
+    price_per_1000_output_tokens: 0.0
+
+    scores:
+      Smart: 3
+      Fast: 5
+      Cheap: 5
 
   whisper:
     type: audio

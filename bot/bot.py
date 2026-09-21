@@ -667,7 +667,7 @@ async def status_handle(update: Update, context: CallbackContext):
     text = (
         "📊 <b>Bot Status</b>\n\n"
         f"🤖 <b>Model:</b> <code>{model}</code>\n"
-        f"🌐 <b>Provider:</b> OpenRouter ({config.llm_base_url})\n"
+        f"🌐 <b>Provider:</b> Groq ({config.llm_base_url})\n"
         f"🔑 <b>API Keys:</b> {pool_stats['active_keys']}/{pool_stats['total_keys']} active\n"
         f"🧠 <b>Your memories:</b> {mem_count}\n"
         f"👥 <b>Total users:</b> {total_users}\n"

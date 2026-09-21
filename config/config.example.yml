@@ -1,15 +1,15 @@
 telegram_token: ""
 
-# OpenRouter (default LLM provider)
-openrouter_api_key: ""
-openrouter_api_base: "https://openrouter.ai/api/v1"
+# Groq (default LLM provider — fast, free tier)
+groq_api_key: ""
+# groq_api_base: "https://api.groq.com/openai/v1"  # default, no need to set
 
 # Multiple API keys for load spreading (comma-separated, optional)
 # If set, rotates keys round-robin to avoid rate limits
-# llm_api_keys: "sk-or-v1-key1,sk-or-v1-key2,sk-or-v1-key3"
+# llm_api_keys: "gsk_key1,gsk_key2,gsk_key3"
 
-# Default model (e.g. nex-agi/nex-n2.5-pro:free)
-default_model: "nex-agi/nex-n2.5-pro:free"
+# Default model
+default_model: "llama-3.3-70b-versatile"
 
 # Bot Owner Telegram user ID (enables /panel, /sethome, /broadcast)
 owner_id: 6274319204
