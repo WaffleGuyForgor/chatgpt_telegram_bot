@@ -1,7 +1,20 @@
-available_text_models: ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+available_text_models:
+  - "openai/gpt-oss-20b"
+  - "openai/gpt-oss-120b"
+  - "nex-agi/nex-n2.5-pro:free"
+  - "nvidia/nemotron-3-ultra-550b-a55b:free"
+  - "nex-agi/nex-n2.5-mini:free"
+  - "deepseek-ai/DeepSeek-V4-Flash-0731"
 
+# Each chat model declares which provider pool serves it:
+#   provider: groq | openrouter | dahl
+# Providers are configured via env vars / config.yml:
+#   groq       -> LLM_API_KEY(S) / GROQ_API_KEY        + llm_base_url
+#   openrouter -> OPENROUTER_API_KEY(S)                + openrouter_base_url
+#   dahl       -> DAHL_API_KEY(S)                      + dahl_base_url
 info:
   openai/gpt-oss-20b:
+    provider: groq
     type: chat_completion
     vision: false
     name: GPT-OSS 20B
@@ -16,6 +29,7 @@ info:
       Cheap: 5
 
   openai/gpt-oss-120b:
+    provider: groq
     type: chat_completion
     vision: false
     name: GPT-OSS 120B
@@ -29,10 +43,73 @@ info:
       Fast: 4
       Cheap: 4
 
+  nex-agi/nex-n2.5-pro:free:
+    provider: openrouter
+    type: chat_completion
+    vision: false
+    recommended: true  # ⭐ Best overall pick — shown as the recommended model in /model
+    name: Nex N2.5 Pro
+    description: Nex AGI's flagship N2.5 Pro on OpenRouter (free tier) — best overall quality and reasoning. ⭐ Recommended as the best model.
+
+    price_per_1000_input_tokens: 0.0
+    price_per_1000_output_tokens: 0.0
+
+    scores:
+      Smart: 5
+      Fast: 3
+      Cheap: 5
+
+  nvidia/nemotron-3-ultra-550b-a55b:free:
+    provider: openrouter
+    type: chat_completion
+    vision: false
+    name: Nemotron 3 Ultra 550B
+    description: NVIDIA's massive Nemotron 3 Ultra 550B (A55B) on OpenRouter (free tier) — huge open model for heavy reasoning and long generations.
+
+    price_per_1000_input_tokens: 0.0
+    price_per_1000_output_tokens: 0.0
+
+    scores:
+      Smart: 5
+      Fast: 2
+      Cheap: 5
+
+  nex-agi/nex-n2.5-mini:free:
+    provider: openrouter
+    type: chat_completion
+    vision: false
+    name: Nex N2.5 Mini
+    description: Nex AGI's lightweight N2.5 Mini on OpenRouter (free tier) — quick and cheap fallback for simple chat and housekeeping tasks.
+
+    price_per_1000_input_tokens: 0.0
+    price_per_1000_output_tokens: 0.0
+
+    scores:
+      Smart: 3
+      Fast: 5
+      Cheap: 5
+
+  deepseek-ai/DeepSeek-V4-Flash-0731:
+    provider: dahl
+    type: chat_completion
+    vision: false
+    name: DeepSeek V4 Flash
+    description: DeepSeek V4 Flash (0731) served by the Dahl inference network — fast general-purpose model, good alternative when other providers are busy.
+
+    price_per_1000_input_tokens: 0.0
+    price_per_1000_output_tokens: 0.0
+
+    scores:
+      Smart: 4
+      Fast: 4
+      Cheap: 5
+
   whisper-large-v3-turbo:
+    provider: groq
     type: audio
     price_per_1_min: 0.000667
 
   whisper-large-v3:
+    provider: groq
     type: audio
     price_per_1_min: 0.00185

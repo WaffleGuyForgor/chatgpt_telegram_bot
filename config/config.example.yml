@@ -8,6 +8,17 @@ groq_api_key: ""
 # If set, rotates keys round-robin to avoid rate limits
 # llm_api_keys: "gsk_key1,gsk_key2,gsk_key3"
 
+# OpenRouter provider (optional — enables the nex-agi / nvidia models in models.yml)
+# openrouter_api_key: ""
+# Multiple OpenRouter keys for rotation (comma-separated, optional):
+# openrouter_api_keys: "sk-or-key1,sk-or-key2"
+# openrouter_base_url: "https://openrouter.ai/api/v1"  # default, no need to set
+
+# Dahl provider (optional — enables deepseek-ai/DeepSeek-V4-Flash-0731)
+# dahl_api_key: ""
+# dahl_api_keys: "dahl_key1,dahl_key2"  # multiple keys for rotation (optional)
+# dahl_base_url: "https://inference.dahl.global/v1"  # default, no need to set
+
 # Default model
 default_model: "openai/gpt-oss-20b"
 

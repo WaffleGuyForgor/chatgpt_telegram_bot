@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 import telegram
+from openai import RateLimitError
 from telegram import (
     Update,
     User,
@@ -71,6 +72,7 @@ You can talk to me completely naturally — no special commands required:
 
 <b>Quick Commands:</b>
 ⚪ /new – Start fresh dialog
+⚪ /model – Switch AI model (anyone can pick)
 ⚪ /memory – View what I remember about you
 ⚪ /memory_clear – Clear all my memories of you
 ⚪ /status – Bot status & stats
@@ -87,6 +89,18 @@ OWNER_HELP = """👑 <b>Owner Controls:</b>
 ⚪ /sethome – Designate current group as Home Chat
 ⚪ /broadcast &lt;text&gt; – Announcement to all users & groups
 """
+
+# Human-readable provider labels for the model picker and /status
+PROVIDER_DISPLAY_NAMES = {
+    "groq": "Groq",
+    "openrouter": "OpenRouter",
+    "dahl": "Dahl",
+}
+
+# Persian note shown in the model picker: if a model is rate-limited, pick another one
+MODEL_PICKER_NOTE_FA = (
+    "⚠️ اگر مدل به محدودیت (Rate Limit) رسید، لطفاً مدل دیگری را انتخاب کنید."
+)
 
 
 def get_semaphore(user_id: int) -> asyncio.Semaphore:
@@ -335,6 +349,21 @@ async def process_user_turn(
         return
 
     current_model = resolve_model(entity_id)
+    current_provider = openai_utils.get_provider_for_model(current_model)
+
+    # Guard: the selected model's provider must have API keys configured
+    if not openai_utils.provider_is_configured(current_provider):
+        provider_label = PROVIDER_DISPLAY_NAMES.get(current_provider, current_provider)
+        await update.message.reply_text(
+            f"⚠️ <b>{html.escape(current_model)}</b> uses the <b>{provider_label}</b> provider, "
+            "which isn't configured yet (missing API key).\n\n"
+            "Please pick another model with /model.\n"
+            "لطفاً با دستور /model مدل دیگری را انتخاب کنید.",
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=update.message.id
+        )
+        return
+
     chatgpt_client = openai_utils.ChatGPT(model=current_model)
 
     async def execute_turn():
@@ -445,6 +474,21 @@ async def process_user_turn(
         except asyncio.CancelledError:
             await update.message.reply_text("🛑 Canceled.")
             raise
+        except RateLimitError:
+            # All keys for this provider are exhausted/cooling down — suggest switching models
+            friendly_err = (
+                "⚠️ This model is rate-limited right now. Please switch to another model with /model.\n\n"
+                "⚠️ این مدل موقتاً به محدودیت (Rate Limit) رسیده است.\n"
+                "لطفاً با دستور /model مدل دیگری را انتخاب کنید."
+            )
+            try:
+                await context.bot.edit_message_text(
+                    friendly_err,
+                    chat_id=placeholder.chat_id,
+                    message_id=placeholder.message_id
+                )
+            except Exception:
+                await update.message.reply_text(friendly_err)
         except Exception as e:
             logger.error(f"Error in turn execution: {traceback.format_exc()}")
             friendly_err = "I couldn't complete that response right now. Please try again in a moment."
@@ -676,15 +720,19 @@ async def cancel_handle(update: Update, context: CallbackContext):
 # =====================================================================
 
 async def status_handle(update: Update, context: CallbackContext):
-    """Shows bot status, model, API key pool stats, and user memory count."""
+    """Shows bot status, model, provider, API key pool stats, and user memory count."""
     await register_chat_and_user(update, context)
     user = update.effective_user
     entity_id = get_entity_id(update)
 
-    pool_stats = openai_utils.get_api_pool().get_stats()
     mem_count = len(db.get_active_memories(f"user:{entity_id}", entity_id))
 
     model = resolve_model(entity_id)
+    provider = openai_utils.get_provider_for_model(model)
+    provider_label = PROVIDER_DISPLAY_NAMES.get(provider, provider)
+    provider_stats = openai_utils.get_provider_stats().get(provider, {})
+    active_keys = provider_stats.get("active_keys", 0)
+    total_keys = provider_stats.get("total_keys", 0)
 
     total_users = db.get_total_users_count()
     total_groups = db.get_total_groups_count()
@@ -692,12 +740,13 @@ async def status_handle(update: Update, context: CallbackContext):
     text = (
         "📊 <b>Bot Status</b>\n\n"
         f"🤖 <b>Model:</b> <code>{model}</code>\n"
-        f"🌐 <b>Provider:</b> Groq ({config.llm_base_url})\n"
-        f"🔑 <b>API Keys:</b> {pool_stats['active_keys']}/{pool_stats['total_keys']} active\n"
+        f"🌐 <b>Provider:</b> {provider_label}\n"
+        f"🔑 <b>Provider API Keys:</b> {active_keys}/{total_keys} active\n"
         f"🧠 <b>Your memories:</b> {mem_count}\n"
         f"👥 <b>Total users:</b> {total_users}\n"
         f"💬 <b>Total groups:</b> {total_groups}\n"
-        f"⚡ <b>Streaming:</b> {'On' if config.enable_message_streaming else 'Off'}\n"
+        f"⚡ <b>Streaming:</b> {'On' if config.enable_message_streaming else 'Off'}\n\n"
+        "<i>Switch models anytime with /model</i>"
     )
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -774,6 +823,102 @@ async def lang_handle(update: Update, context: CallbackContext):
     else:
         db.set_user_attribute(entity_id, "language", lang)
         await update.message.reply_text(f"🌐 Language set to <b>{lang}</b>. I'll respond in this language.", parse_mode=ParseMode.HTML)
+
+
+# =====================================================================
+# PUBLIC MODEL PICKER (/model) — anyone can switch models across providers
+# =====================================================================
+
+def build_model_picker(entity_id: int):
+    """Builds the inline-keyboard model picker for the /model command (open to everyone)."""
+    current = resolve_model(entity_id)
+    text = (
+        "🤖 <b>Choose an AI model</b>\n\n"
+        f"Current: <code>{html.escape(current)}</code>\n"
+        "⭐ = بهترین مدل (best overall)\n\n"
+        f"{MODEL_PICKER_NOTE_FA}\n"
+        "<i>(If a model hits a rate limit, just switch to another one.)</i>"
+    )
+
+    buttons = []
+    for model_id in config.models.get("available_text_models", []):
+        info = config.models.get("info", {}).get(model_id, {})
+        name = info.get("name", model_id)
+        provider = info.get("provider", "groq")
+        provider_label = PROVIDER_DISPLAY_NAMES.get(provider, provider)
+
+        label = ""
+        if model_id == current:
+            label += "✅ "
+        if info.get("recommended"):
+            label += "⭐ "
+        label += f"{name} · {provider_label}"
+
+        buttons.append([InlineKeyboardButton(label, callback_data=f"model|set|{model_id}")])
+
+    return text, InlineKeyboardMarkup(buttons)
+
+
+async def model_handle(update: Update, context: CallbackContext):
+    """Public model picker — anyone can switch their own (or the group's) model."""
+    await register_chat_and_user(update, context)
+    entity_id = get_entity_id(update)
+    text, reply_markup = build_model_picker(entity_id)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+
+async def model_picker_callback_handle(update: Update, context: CallbackContext):
+    """Handles model selection from the public /model picker."""
+    query = update.callback_query
+    parts = (query.data or "").split("|", 2)
+    if len(parts) < 3 or parts[1] != "set":
+        await query.answer()
+        return
+
+    selected = parts[2]
+    if selected not in config.models.get("available_text_models", []):
+        await query.answer("❌ This model is no longer available.", show_alert=True)
+        return
+
+    entity_id = get_entity_id(update)
+
+    try:
+        if entity_id > 0:
+            db.set_user_attribute(entity_id, "current_model", selected)
+        else:
+            db.set_chat_attribute(entity_id, "current_model", selected)
+    except Exception as e:
+        logger.error(f"Failed to persist model selection for {entity_id}: {e}")
+        await query.answer("❌ Could not save the model choice, try again.", show_alert=True)
+        return
+
+    info = config.models.get("info", {}).get(selected, {})
+    name = info.get("name", selected)
+    provider = info.get("provider", "groq")
+    provider_label = PROVIDER_DISPLAY_NAMES.get(provider, provider)
+
+    warning = ""
+    if not openai_utils.provider_is_configured(provider):
+        warning = (
+            f"\n\n⚠️ Heads-up: the <b>{provider_label}</b> provider has no API key configured yet, "
+            "so this model won't respond until the bot owner adds one."
+        )
+
+    await query.answer(f"✅ Switched to {name}")
+
+    text, reply_markup = build_model_picker(entity_id)
+    confirmation = (
+        f"✅ <b>Model switched to:</b> {html.escape(name)} "
+        f"(<code>{html.escape(selected)}</code>) via <b>{provider_label}</b>{warning}\n\n"
+    )
+    try:
+        await query.edit_message_text(
+            confirmation + text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.warning(f"Could not edit model picker message: {e}")
 
 
 # --- Owner Panel ---
@@ -896,8 +1041,10 @@ async def owner_panel_callback_handle(update: Update, context: CallbackContext):
         text = "🤖 <b>Select Global Default Model</b>:"
         buttons = []
         for m in config.models.get("available_text_models", []):
-            m_name = config.models["info"].get(m, {}).get("name", m)
-            buttons.append([InlineKeyboardButton(m_name, callback_data=f"owner_panel|set_model|{m}")])
+            m_info = config.models["info"].get(m, {})
+            m_name = m_info.get("name", m)
+            m_provider = PROVIDER_DISPLAY_NAMES.get(m_info.get("provider", "groq"), m_info.get("provider", "groq"))
+            buttons.append([InlineKeyboardButton(f"{m_name} · {m_provider}", callback_data=f"owner_panel|set_model|{m}")])
         buttons.append([InlineKeyboardButton("« Back", callback_data="owner_panel|main")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
 
@@ -964,6 +1111,7 @@ async def post_init(application: Application):
     commands = [
         BotCommand("/new", "Start fresh dialog"),
         BotCommand("/help", "Show help message"),
+        BotCommand("/model", "🤖 Switch AI model"),
         BotCommand("/status", "📊 Bot status & stats"),
         BotCommand("/ping", "🏓 Latency check"),
         BotCommand("/memory", "🧠 View my memories"),
@@ -1004,6 +1152,11 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("memory", memory_handle))
     application.add_handler(CommandHandler("memory_clear", memory_clear_handle))
     application.add_handler(CommandHandler("lang", lang_handle))
+
+    # Public model picker (anyone can switch models across providers)
+    application.add_handler(CommandHandler("model", model_handle))
+    application.add_handler(CommandHandler("models", model_handle))
+    application.add_handler(CallbackQueryHandler(model_picker_callback_handle, pattern="^model\\|"))
 
     # Owner commands
     application.add_handler(CommandHandler("panel", panel_command_handle))

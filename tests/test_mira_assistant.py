@@ -12,6 +12,8 @@ from bot.memory import MemoryEngine, cosine_similarity, tokenize
 from bot.personality import PersonalityEngine
 from bot.group_engine import GroupEngine
 from bot.bot import split_text_into_chunks
+import bot.config as bot_config
+from bot import openai_utils
 
 
 class DummyDatabase:
@@ -127,6 +129,51 @@ class TestMiraAssistant(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(len(chunks) >= 2)
         for chunk in chunks:
             self.assertLessEqual(len(chunk), 3600)
+
+
+class TestMultiProviderRouting(unittest.TestCase):
+    """Validates the model -> provider routing layer (models.yml + openai_utils)."""
+
+    def test_all_available_models_have_provider(self):
+        for model_id in bot_config.models.get("available_text_models", []):
+            info = bot_config.models.get("info", {}).get(model_id, {})
+            self.assertIn("provider", info, f"Model '{model_id}' is missing a provider")
+            self.assertIn(
+                info["provider"],
+                ("groq", "openrouter", "dahl"),
+                f"Model '{model_id}' has unknown provider '{info['provider']}'"
+            )
+
+    def test_get_provider_for_model(self):
+        self.assertEqual(openai_utils.get_provider_for_model("openai/gpt-oss-20b"), "groq")
+        self.assertEqual(openai_utils.get_provider_for_model("openai/gpt-oss-120b"), "groq")
+        self.assertEqual(openai_utils.get_provider_for_model("nex-agi/nex-n2.5-pro:free"), "openrouter")
+        self.assertEqual(openai_utils.get_provider_for_model("nvidia/nemotron-3-ultra-550b-a55b:free"), "openrouter")
+        self.assertEqual(openai_utils.get_provider_for_model("nex-agi/nex-n2.5-mini:free"), "openrouter")
+        self.assertEqual(openai_utils.get_provider_for_model("deepseek-ai/DeepSeek-V4-Flash-0731"), "dahl")
+        # Unknown models fall back to the default (groq) provider
+        self.assertEqual(openai_utils.get_provider_for_model("unknown/model"), "groq")
+
+    def test_groq_remains_default(self):
+        self.assertEqual(openai_utils.get_provider_for_model(bot_config.default_model), "groq")
+        self.assertEqual(bot_config.models["available_text_models"][0], "openai/gpt-oss-20b")
+
+    def test_nex_pro_is_recommended_best(self):
+        info = bot_config.models["info"]["nex-agi/nex-n2.5-pro:free"]
+        self.assertTrue(info.get("recommended"), "Nex N2.5 Pro should be marked as the recommended/best model")
+
+    def test_new_models_in_available_list(self):
+        available = bot_config.models["available_text_models"]
+        for expected in (
+            "nex-agi/nex-n2.5-pro:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "nex-agi/nex-n2.5-mini:free",
+            "deepseek-ai/DeepSeek-V4-Flash-0731",
+        ):
+            self.assertIn(expected, available)
+
+    def test_dahl_base_url(self):
+        self.assertEqual(bot_config.dahl_base_url, "https://inference.dahl.global/v1")
 
 
 if __name__ == "__main__":

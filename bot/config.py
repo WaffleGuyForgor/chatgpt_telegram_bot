@@ -76,6 +76,32 @@ else:
 llm_api_key = _single_key
 llm_base_url = _get("llm_base_url") or "https://api.groq.com/openai/v1"
 
+# --- Additional LLM providers (per-model routing via models.yml `provider:`) ---
+
+# OpenRouter (supports multiple keys for load spreading: OPENROUTER_API_KEYS=k1,k2,k3)
+_openrouter_single_key = _get("openrouter_api_key") or ""
+_openrouter_multi_keys = _get("openrouter_api_keys") or ""  # comma-separated
+if _openrouter_multi_keys:
+    openrouter_api_keys = [k.strip() for k in str(_openrouter_multi_keys).split(",") if k.strip()]
+else:
+    openrouter_api_keys = [_openrouter_single_key] if _openrouter_single_key else []
+openrouter_base_url = _get("openrouter_base_url") or "https://openrouter.ai/api/v1"
+
+# Dahl inference network (supports multiple keys: DAHL_API_KEYS=k1,k2)
+_dahl_single_key = _get("dahl_api_key") or ""
+_dahl_multi_keys = _get("dahl_api_keys") or ""  # comma-separated
+if _dahl_multi_keys:
+    dahl_api_keys = [k.strip() for k in str(_dahl_multi_keys).split(",") if k.strip()]
+else:
+    dahl_api_keys = [_dahl_single_key] if _dahl_single_key else []
+dahl_base_url = _get("dahl_base_url") or "https://inference.dahl.global/v1"
+
+# Provider registry: name -> (api keys, base url). "groq" is the default provider.
+provider_registry = {
+    "groq": {"keys": llm_api_keys, "base_url": llm_base_url},
+    "openrouter": {"keys": openrouter_api_keys, "base_url": openrouter_base_url},
+    "dahl": {"keys": dahl_api_keys, "base_url": dahl_base_url},
+}
 import logging as _cfg_log
 _cfg_log.getLogger(__name__).info(f"LLM API keys loaded: {len(llm_api_keys)} key(s) for {llm_base_url}")
 if llm_api_keys:
@@ -84,6 +110,13 @@ if llm_api_keys:
         _cfg_log.getLogger(__name__).info(f"  Key #{_i}: {_masked} (len={len(_k)})")
 else:
     _cfg_log.getLogger(__name__).warning("NO API KEYS LOADED! Check GROQ_API_KEY or LLM_API_KEY env var.")
+
+_cfg_log.getLogger(__name__).info(
+    f"OpenRouter provider: {len(openrouter_api_keys)} key(s) for {openrouter_base_url}"
+)
+_cfg_log.getLogger(__name__).info(
+    f"Dahl provider: {len(dahl_api_keys)} key(s) for {dahl_base_url}"
+)
 
 # Bot owner ID (full control panel in DMs)
 owner_id = _get("owner_id", 6274319204)

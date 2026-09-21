@@ -22,6 +22,14 @@ import config
 logger = logging.getLogger(__name__)
 
 
+class ProviderNotConfiguredError(Exception):
+    """Raised when a model's provider has no API keys configured."""
+
+    def __init__(self, provider: str):
+        self.provider = provider
+        super().__init__(f"No API keys configured for provider '{provider}'")
+
+
 class APIKeyPool:
     """
     Round-robin API key pool with cooldown.
@@ -43,8 +51,18 @@ class APIKeyPool:
 
         logger.info(f"API key pool initialized: {len(keys)} keys for {base_url}")
 
+    @property
+    def num_keys(self) -> int:
+        return len(self._keys)
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
     def _get_next_client(self) -> Tuple[AsyncOpenAI, int]:
         """Returns the next available client via round-robin, skipping keys in cooldown."""
+        if not self._keys:
+            raise ProviderNotConfiguredError(self._base_url)
         now = time.time()
         attempts = 0
         while attempts < len(self._keys):
@@ -73,10 +91,57 @@ class APIKeyPool:
         }
 
 
-# Build the API key pool
-_llm_keys = config.llm_api_keys  # List of API keys
+# Build per-provider API key pools (Groq = default, OpenRouter, Dahl)
+DEFAULT_PROVIDER = "groq"
+
+_provider_pools: Dict[str, APIKeyPool] = {}
+for _provider_name, _provider_cfg in config.provider_registry.items():
+    _keys = _provider_cfg.get("keys") or []
+    _base = _provider_cfg.get("base_url") or ""
+    if _keys:
+        _provider_pools[_provider_name] = APIKeyPool(_keys, _base, cooldown_seconds=60)
+    else:
+        logger.warning(f"Provider '{_provider_name}' has no API keys — its models will be unavailable.")
+
+# Backward-compatible handle on the default (Groq) pool — used for Whisper/images.
+# Falls back to any configured pool so audio/images keep working if only e.g. OpenRouter is set up.
+_api_pool: Optional[APIKeyPool] = _provider_pools.get(DEFAULT_PROVIDER) or next(
+    iter(_provider_pools.values()), None
+)
+
+# Keep legacy module-level names for any external imports
+_llm_keys = config.llm_api_keys
 _llm_base_url = config.llm_base_url
-_api_pool = APIKeyPool(_llm_keys, _llm_base_url, cooldown_seconds=60)
+
+
+def get_provider_for_model(model: str) -> str:
+    """Resolves which provider serves a given model (from models.yml `provider:` field)."""
+    info = config.models.get("info", {}).get(model, {})
+    return info.get("provider", DEFAULT_PROVIDER)
+
+
+def get_pool_for_model(model: str) -> APIKeyPool:
+    """Returns the API key pool that serves the given model."""
+    provider = get_provider_for_model(model)
+    pool = _provider_pools.get(provider)
+    if pool is None:
+        raise ProviderNotConfiguredError(provider)
+    return pool
+
+
+def provider_is_configured(provider: str) -> bool:
+    """True if the provider has at least one API key configured."""
+    return provider in _provider_pools
+
+
+def get_provider_stats() -> Dict[str, Dict]:
+    """Per-provider key pool stats for /status and the owner panel."""
+    stats = {}
+    for name, pool in _provider_pools.items():
+        s = pool.get_stats()
+        s["base_url"] = pool.base_url
+        stats[name] = s
+    return stats
 
 # Embedding client (single key)
 embedding_client = AsyncOpenAI(
@@ -96,13 +161,14 @@ DEFAULT_COMPLETION_OPTIONS = {
 
 
 def get_api_pool() -> APIKeyPool:
-    """Returns the global API key pool for stats display."""
+    """Returns the default (Groq) API key pool for stats display."""
     return _api_pool
 
 
 class ChatGPT:
     def __init__(self, model: Optional[str] = None):
         self.model = model or config.default_model
+        self.provider = get_provider_for_model(self.model)
 
     async def send_message(
         self,
@@ -110,14 +176,19 @@ class ChatGPT:
         temperature: float = 0.7,
         max_tokens: int = 1200
     ) -> Tuple[str, Tuple[int, int]]:
-        """Sends messages to the LLM with automatic key rotation on rate limits."""
+        """Sends messages to the LLM with automatic key rotation on rate limits.
+
+        Uses the key pool of the provider that serves `self.model`
+        (Groq / OpenRouter / Dahl — see models.yml `provider:`).
+        """
         options = dict(DEFAULT_COMPLETION_OPTIONS)
         options["temperature"] = temperature
         options["max_tokens"] = max_tokens
 
+        pool = get_pool_for_model(self.model)
         last_error = None
-        for attempt in range(len(_llm_keys) + 1):
-            client, key_idx = _api_pool._get_next_client()
+        for attempt in range(pool.num_keys + 1):
+            client, key_idx = pool._get_next_client()
             try:
                 r = await client.chat.completions.create(
                     model=self.model,
@@ -130,9 +201,9 @@ class ChatGPT:
                 n_out = usage.completion_tokens if usage else 0
                 return answer, (n_in, n_out)
             except RateLimitError as e:
-                _api_pool.mark_rate_limited(key_idx)
+                pool.mark_rate_limited(key_idx)
                 last_error = e
-                logger.warning(f"Rate limit on key #{key_idx} (attempt {attempt + 1}), rotating...")
+                logger.warning(f"Rate limit on {self.provider} key #{key_idx} (attempt {attempt + 1}), rotating...")
                 await asyncio.sleep(1.0)
                 continue
             except (AuthenticationError, NotFoundError, PermissionDeniedError) as e:
@@ -158,15 +229,16 @@ class ChatGPT:
         temperature: float = 0.7,
         max_tokens: int = 1200
     ) -> AsyncGenerator[Tuple[str, str, Tuple[int, int]], None]:
-        """Streams completion tokens with key rotation."""
+        """Streams completion tokens with key rotation across the model's provider pool."""
         options = dict(DEFAULT_COMPLETION_OPTIONS)
         options["temperature"] = temperature
         options["max_tokens"] = max_tokens
         options["stream"] = True
 
+        pool = get_pool_for_model(self.model)
         last_error = None
-        for attempt in range(len(_llm_keys) + 1):
-            client, key_idx = _api_pool._get_next_client()
+        for attempt in range(pool.num_keys + 1):
+            client, key_idx = pool._get_next_client()
             try:
                 r_gen = await client.chat.completions.create(
                     model=self.model,
@@ -193,9 +265,9 @@ class ChatGPT:
                 return  # success, exit retry loop
 
             except RateLimitError as e:
-                _api_pool.mark_rate_limited(key_idx)
+                pool.mark_rate_limited(key_idx)
                 last_error = e
-                logger.warning(f"Rate limit on key #{key_idx} during streaming, rotating...")
+                logger.warning(f"Rate limit on {self.provider} key #{key_idx} during streaming, rotating...")
                 await asyncio.sleep(1.0)
                 continue
             except (AuthenticationError, NotFoundError, PermissionDeniedError) as e:
@@ -240,8 +312,13 @@ async def fast_chat_completion(
 ) -> str:
     """Lightweight helper for background tasks (summarization, memory extraction) with key rotation."""
     target_model = model or config.memory_model
-    for attempt in range(len(_llm_keys) + 1):
-        client, key_idx = _api_pool._get_next_client()
+    try:
+        pool = get_pool_for_model(target_model)
+    except ProviderNotConfiguredError as e:
+        logger.warning(f"fast_chat_completion skipped: {e}")
+        return ""
+    for attempt in range(pool.num_keys + 1):
+        client, key_idx = pool._get_next_client()
         try:
             r = await client.chat.completions.create(
                 model=target_model,
@@ -252,7 +329,7 @@ async def fast_chat_completion(
             )
             return (r.choices[0].message.content or "").strip()
         except RateLimitError:
-            _api_pool.mark_rate_limited(key_idx)
+            pool.mark_rate_limited(key_idx)
             await asyncio.sleep(1.0)
             continue
         except Exception as e:
@@ -282,7 +359,9 @@ async def get_embedding(text: str) -> Optional[List[float]]:
 
 
 async def transcribe_audio(audio_file: BytesIO) -> str:
-    """Transcribes audio using Whisper or speech-to-text API."""
+    """Transcribes audio using Whisper or speech-to-text API (default provider pool)."""
+    if _api_pool is None:
+        raise ProviderNotConfiguredError(DEFAULT_PROVIDER)
     client, _ = _api_pool._get_next_client()
     try:
         r = await client.audio.transcriptions.create(model="whisper-1", file=audio_file)
@@ -293,7 +372,9 @@ async def transcribe_audio(audio_file: BytesIO) -> str:
 
 
 async def generate_images(prompt: str, n_images: int = 1, size: str = "1024x1024") -> List[bytes]:
-    """Generates images using OpenAI/compatible image API."""
+    """Generates images using OpenAI/compatible image API (default provider pool)."""
+    if _api_pool is None:
+        raise ProviderNotConfiguredError(DEFAULT_PROVIDER)
     client, _ = _api_pool._get_next_client()
     r = await client.images.generate(model="gpt-image-1", prompt=prompt, n=n_images, size=size)
     images = [base64.b64decode(item.b64_json) for item in r.data if getattr(item, "b64_json", None)]

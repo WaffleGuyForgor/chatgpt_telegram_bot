@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0]
+
+### Added
+- **Multi-Provider Model Switching**:
+  - Models in `config/models.yml` now declare a `provider:` field (`groq`, `openrouter`, `dahl`) and each request is routed to that provider's own API key pool and base URL.
+  - **OpenRouter provider** with free-tier models: `nex-agi/nex-n2.5-pro:free` (⭐ marked as the best/recommended pick), `nvidia/nemotron-3-ultra-550b-a55b:free`, `nex-agi/nex-n2.5-mini:free`.
+  - **Dahl provider** (`https://inference.dahl.global/v1`) with `deepseek-ai/DeepSeek-V4-Flash-0731`.
+  - **Groq remains the default provider/model** (`openai/gpt-oss-20b`).
+  - Multiple API keys per provider for round-robin rotation with rate-limit cooldown: `OPENROUTER_API_KEYS` / `OPENROUTER_API_KEY` and `DAHL_API_KEYS` / `DAHL_API_KEY` (comma-separated), mirroring the existing `LLM_API_KEYS` behavior for Groq.
+- **Public Model Picker (`/model`, `/models`)**: anyone (DMs and group members) can switch the active model via an inline keyboard. The picker shows the current model (✅), the recommended best model (⭐ Nex N2.5 Pro), the serving provider per model, and a Persian note: *"اگر مدل به محدودیت (Rate Limit) رسید، لطفاً مدل دیگری را انتخاب کنید."* (if a model is rate-limited, pick another one).
+- **Rate-limit friendly errors**: when all keys of a provider are exhausted, the bot replies with a bilingual (English/Persian) message suggesting to switch models via `/model` instead of a generic failure.
+- **Provider guard**: selecting or using a model whose provider has no API key configured produces a clear bilingual warning instead of an API crash.
+- `/status` now shows the active model's provider and that provider's key-pool health.
+- Owner panel's *Switch Model* list now labels each model with its provider.
+- New tests covering model→provider routing, models.yml provider integrity, the Groq default, and the ⭐ recommended flag.
+
+### Changed
+- `openai_utils` now maintains one `APIKeyPool` per provider instead of a single global pool; `ChatGPT.send_message`, `send_message_stream`, and `fast_chat_completion` resolve the correct pool from the target model.
+- Audio transcription and image generation keep using the default (Groq) pool, falling back to any configured provider pool.
+- Updated `config/config.example.env` and `config/config.example.yml` with the new provider variables.
+
 ## [2.0.0]
 
 ### Added
