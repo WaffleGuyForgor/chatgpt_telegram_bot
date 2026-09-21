@@ -78,15 +78,10 @@ llm_base_url = _get("llm_base_url") or "https://api.groq.com/openai/v1"
 
 import logging as _cfg_log
 _cfg_log.getLogger(__name__).info(f"LLM API keys loaded: {len(llm_api_keys)} key(s) for {llm_base_url}")
-_cfg_log.getLogger(__name__).info(f"Default model: {default_model}")
 if llm_api_keys:
     for _i, _k in enumerate(llm_api_keys):
         _masked = _k[:6] + "..." + _k[-4:] if len(_k) > 10 else "???"
         _cfg_log.getLogger(__name__).info(f"  Key #{_i}: {_masked} (len={len(_k)})")
-if llm_api_keys:
-    for _i, _k in enumerate(llm_api_keys):
-        _masked = _k[:8] + "..." + _k[-4:] if len(_k) > 12 else "???"
-        _cfg_log.getLogger(__name__).info(f"  Key #{_i}: {_masked} (len={len(_k)}, starts_with={_k[:3]})")
 else:
     _cfg_log.getLogger(__name__).warning("NO API KEYS LOADED! Check GROQ_API_KEY or LLM_API_KEY env var.")
 
@@ -164,9 +159,10 @@ with open(config_dir / 'models.yml', 'r', encoding="utf-8") as f:
 default_model = _get("default_model") or models["available_text_models"][0]
 # Validate model exists in models.yml — if not, use first available
 if default_model not in models["info"]:
-    import logging as _cfg_log2
-    _cfg_log2.getLogger(__name__).warning(f"Model '{default_model}' not found in models.yml, using '{models['available_text_models'][0]}'")
+    _cfg_log.getLogger(__name__).warning(f"Model '{default_model}' not found in models.yml, using '{models['available_text_models'][0]}'")
     default_model = models["available_text_models"][0]
+
+_cfg_log.getLogger(__name__).info(f"Default model: {default_model}")
 
 # Background memory extraction & summarization model (falls back to default_model)
 memory_model = _get("memory_model") or default_model
