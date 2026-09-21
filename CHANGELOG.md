@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — Phase 2 Polish, Stage 1 (fast UX, adaptive length, natural tone)
+- **Intelligent response length** (`bot/response_tuning.py`): every request is classified as `tiny` / `short` / `normal` / `detailed` / `deep`, which drives the `max_tokens` budget (150 → 4000) and a per-turn length instruction in the system prompt. Explicit user control (*"in one sentence"*, *"detailed explanation"*, *"comprehensive guide"*) always overrides the heuristics.
+- **Soft mood adaptation**: each message gets an ephemeral tone signal (`joking` / `frustrated` / `technical` / `casual` / `serious` / `neutral`) injected as an explicitly-marked soft guess — never stored, never treated as fact.
+- **Contextual status messages**: the placeholder is picked per request size ("Hmm…", "Looking into it…", "Working on that…", "Putting that together…") instead of a static "Thinking…", once per request (no fake progress).
+- **Anti-generic-AI rules**: the base identity now bans filler openers (*Certainly! / Great question!*), per-message greetings, question restating, obligatory conclusions, and *"Let me know if…"* closers; requires honest "I don't know" behavior and natural structural variation.
+- **Lightweight response self-check** before delivery (no second model pass): strips banned openers if the model emits them anyway, trims essay-length answers to micro-questions, and proactively detects unbalanced/unsupported HTML so the final message falls back to plain text instead of hitting a Telegram `BadRequest`.
+
 ## [2.1.0]
 
 ### Added

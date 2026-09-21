@@ -35,6 +35,7 @@ from telegram.constants import ParseMode, ChatAction, ChatType
 import config
 import database
 import openai_utils
+import response_tuning
 from memory import MemoryEngine
 from multimodal import MultimodalInterpreter
 from personality import PersonalityEngine
@@ -246,7 +247,7 @@ async def process_user_turn(
     raw_text: str,
     image_data_url: Optional[str] = None,
     document_context: Optional[str] = None,
-    initial_status: str = "Thinking…"
+    initial_status: Optional[str] = None
 ):
     user = update.effective_user
     chat = update.effective_chat
@@ -258,6 +259,18 @@ async def process_user_turn(
     clean_text = raw_text
     if is_group and context.bot.username:
         clean_text = clean_text.replace(f"@{context.bot.username}", "").strip()
+
+    # Request tuning: size class drives token budget + length guidance;
+    # mood is an ephemeral soft tone signal; status message matches the task.
+    request_size = response_tuning.classify_request_size(
+        clean_text,
+        has_document=bool(document_context),
+        has_image=bool(image_data_url)
+    )
+    mood = response_tuning.detect_conversation_mood(clean_text)
+    max_tokens = response_tuning.max_tokens_for_size(request_size)
+    if initial_status is None:
+        initial_status = response_tuning.pick_status_message(request_size)
 
     # 1. Natural Language Memory Intent Check
     intent, intent_arg = memory_engine.detect_memory_intent(clean_text)
@@ -338,7 +351,9 @@ async def process_user_turn(
         group_title=chat.title if is_group else "",
         image_data_url=image_data_url,
         document_context=document_context,
-        reply_context=reply_context
+        reply_context=reply_context,
+        mood_hint=response_tuning.mood_instruction(mood),
+        length_hint=response_tuning.length_instruction(request_size)
     )
 
     # 6. Lock Semaphore per-user (so different users can talk simultaneously in groups)
@@ -377,7 +392,7 @@ async def process_user_turn(
 
         try:
             if config.enable_message_streaming:
-                gen = chatgpt_client.send_message_stream(llm_messages)
+                gen = chatgpt_client.send_message_stream(llm_messages, max_tokens=max_tokens)
                 prev_text = ""
                 last_edit_time = asyncio.get_event_loop().time()
 
@@ -386,16 +401,29 @@ async def process_user_turn(
                     n_input_tokens, n_output_tokens = n_in, n_out
                     now = asyncio.get_event_loop().time()
 
+                    # Lightweight self-check on the completed answer (§16)
+                    if status == "finished":
+                        answer = response_tuning.self_check_answer(answer, request_size)
+
                     # Throttle edits to respect Telegram limits
                     if (abs(len(answer) - len(prev_text)) >= 70 or status == "finished") and (now - last_edit_time >= 0.4 or status == "finished"):
                         display_text = answer[:4000]
+                        # On the final message, proactively avoid broken HTML
+                        final_plain = status == "finished" and not response_tuning.html_is_balanced(display_text)
                         try:
-                            await context.bot.edit_message_text(
-                                display_text,
-                                chat_id=placeholder.chat_id,
-                                message_id=placeholder.message_id,
-                                parse_mode=ParseMode.HTML
-                            )
+                            if final_plain:
+                                await context.bot.edit_message_text(
+                                    display_text,
+                                    chat_id=placeholder.chat_id,
+                                    message_id=placeholder.message_id
+                                )
+                            else:
+                                await context.bot.edit_message_text(
+                                    display_text,
+                                    chat_id=placeholder.chat_id,
+                                    message_id=placeholder.message_id,
+                                    parse_mode=ParseMode.HTML
+                                )
                         except telegram.error.BadRequest as e:
                             if "Message is not modified" not in str(e):
                                 # Fallback to plain text if HTML tags broken
@@ -410,14 +438,22 @@ async def process_user_turn(
                         prev_text = answer
                         last_edit_time = now
             else:
-                answer, (n_input_tokens, n_output_tokens) = await chatgpt_client.send_message(llm_messages)
+                answer, (n_input_tokens, n_output_tokens) = await chatgpt_client.send_message(llm_messages, max_tokens=max_tokens)
+                answer = response_tuning.self_check_answer(answer, request_size)
                 try:
-                    await context.bot.edit_message_text(
-                        answer[:4000],
-                        chat_id=placeholder.chat_id,
-                        message_id=placeholder.message_id,
-                        parse_mode=ParseMode.HTML
-                    )
+                    if response_tuning.html_is_balanced(answer[:4000]):
+                        await context.bot.edit_message_text(
+                            answer[:4000],
+                            chat_id=placeholder.chat_id,
+                            message_id=placeholder.message_id,
+                            parse_mode=ParseMode.HTML
+                        )
+                    else:
+                        await context.bot.edit_message_text(
+                            answer[:4000],
+                            chat_id=placeholder.chat_id,
+                            message_id=placeholder.message_id
+                        )
                 except Exception:
                     await context.bot.edit_message_text(
                         answer[:4000],
@@ -553,7 +589,7 @@ async def text_message_handle(update: Update, context: CallbackContext):
         update=update,
         context=context,
         raw_text=update.message.text,
-        initial_status="Thinking…"
+        initial_status=None  # dynamic: picked from contextual status pool by request size
     )
 
 
@@ -606,7 +642,7 @@ async def voice_message_handle(update: Update, context: CallbackContext):
         update=update,
         context=context,
         raw_text=transcript,
-        initial_status="Thinking…"
+        initial_status=None  # dynamic status after transcription
     )
 
 

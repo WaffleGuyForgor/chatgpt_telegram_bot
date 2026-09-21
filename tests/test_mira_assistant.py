@@ -14,6 +14,7 @@ from bot.group_engine import GroupEngine
 from bot.bot import split_text_into_chunks
 import bot.config as bot_config
 from bot import openai_utils
+from bot import response_tuning
 
 
 class DummyDatabase:
@@ -174,6 +175,71 @@ class TestMultiProviderRouting(unittest.TestCase):
 
     def test_dahl_base_url(self):
         self.assertEqual(bot_config.dahl_base_url, "https://inference.dahl.global/v1")
+
+
+class TestResponseTuning(unittest.TestCase):
+    """Stage 1 polish: request-size classification, mood hints, self-checks."""
+
+    def test_size_classification(self):
+        rt = response_tuning
+        self.assertEqual(rt.classify_request_size("What is 9×9?"), "tiny")
+        self.assertEqual(rt.classify_request_size("lol"), "tiny")
+        self.assertEqual(rt.classify_request_size("How does DNS work?"), "short")
+        self.assertEqual(rt.classify_request_size("Compare PostgreSQL and MySQL for a high-write workload"), "detailed")
+        self.assertEqual(rt.classify_request_size("Design an entire distributed task queue system"), "deep")
+
+    def test_explicit_length_overrides(self):
+        rt = response_tuning
+        self.assertEqual(rt.classify_request_size("Explain quantum computing in one sentence"), "tiny")
+        self.assertEqual(rt.classify_request_size("How does DNS work? Give me a detailed explanation"), "detailed")
+        self.assertEqual(rt.classify_request_size("Write a comprehensive guide to Kubernetes from scratch"), "deep")
+        self.assertEqual(rt.classify_request_size("Give me a short answer: what is a mutex?"), "short")
+
+    def test_max_tokens_monotonic(self):
+        rt = response_tuning
+        sizes = ["tiny", "short", "normal", "detailed", "deep"]
+        budgets = [rt.max_tokens_for_size(s) for s in sizes]
+        self.assertEqual(budgets, sorted(budgets))
+        self.assertTrue(all(b > 0 for b in budgets))
+
+    def test_length_instructions_exist(self):
+        for size in ("tiny", "short", "normal", "detailed", "deep"):
+            self.assertTrue(response_tuning.length_instruction(size))
+
+    def test_mood_detection(self):
+        rt = response_tuning
+        self.assertEqual(rt.detect_conversation_mood("lol that's hilarious 😂"), "joking")
+        self.assertEqual(rt.detect_conversation_mood("wtf why is this broken again"), "frustrated")
+        self.assertEqual(rt.detect_conversation_mood("I keep getting a NullPointerException in my function"), "technical")
+        self.assertEqual(rt.detect_conversation_mood("yo sup"), "casual")
+        self.assertEqual(rt.detect_conversation_mood("serious question: should I quit my job?"), "serious")
+        self.assertEqual(rt.detect_conversation_mood("What is the capital of France?"), "neutral")
+
+    def test_mood_hints_are_soft_signals(self):
+        hint = response_tuning.mood_instruction("frustrated")
+        self.assertIn("soft guess", hint)
+        self.assertEqual(response_tuning.mood_instruction("neutral"), "")
+
+    def test_self_check_strips_generic_openers(self):
+        rt = response_tuning
+        self.assertEqual(rt.self_check_answer("Certainly! Here is the answer."), "Here is the answer.")
+        self.assertEqual(rt.self_check_answer("Great question! 2+2 is 4."), "2+2 is 4.")
+        self.assertEqual(rt.self_check_answer("DNS resolves domain names."), "DNS resolves domain names.")
+        self.assertEqual(rt.self_check_answer(""), "")
+
+    def test_html_balance_check(self):
+        rt = response_tuning
+        self.assertTrue(rt.html_is_balanced("<b>bold</b> and <code>x = 1</code>"))
+        self.assertTrue(rt.html_is_balanced("plain text, no tags"))
+        self.assertFalse(rt.html_is_balanced("<b>unclosed"))
+        self.assertFalse(rt.html_is_balanced("</b>closing first"))
+        self.assertFalse(rt.html_is_balanced("<script>alert(1)</script>"))
+
+    def test_status_messages(self):
+        for size in ("tiny", "short", "normal", "detailed", "deep", "unknown"):
+            msg = response_tuning.pick_status_message(size)
+            self.assertIsInstance(msg, str)
+            self.assertTrue(msg.endswith("…"))
 
 
 if __name__ == "__main__":

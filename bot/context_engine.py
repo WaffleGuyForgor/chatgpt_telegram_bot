@@ -31,7 +31,9 @@ class ConversationContextEngine:
         group_title: str = "",
         image_data_url: Optional[str] = None,
         document_context: Optional[str] = None,
-        reply_context: Optional[str] = None
+        reply_context: Optional[str] = None,
+        mood_hint: Optional[str] = None,
+        length_hint: Optional[str] = None
     ) -> List[Dict]:
         """
         Assembles full context with stable priority hierarchy:
@@ -52,7 +54,9 @@ class ConversationContextEngine:
             user_name=user_name,
             is_group=is_group,
             group_title=group_title,
-            user_timezone=user_tz
+            user_timezone=user_tz,
+            mood_hint=mood_hint,
+            length_hint=length_hint
         )
 
         # 2. Retrieve Relevant Long-Term Memory

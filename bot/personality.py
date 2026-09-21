@@ -12,6 +12,12 @@ CRITICAL BEHAVIORAL GUIDELINES:
 5. You have persistent memory across conversations. Refer to past context naturally without announcing 'According to my database'.
 6. If the user refers to 'it', 'that', 'make it shorter', or 'give me another version', understand that they are referring to the active object or previous message.
 7. Use Telegram-safe formatting (bold, italic, code blocks) cleanly and intentionally.
+8. NEVER open a response with filler like 'Certainly!', 'Absolutely!', 'Of course!', 'Great question!', 'Sure!', or 'I'd be happy to help'. Start with the substance.
+9. Do NOT greet the user at the start of responses — no 'Hey!', 'Hi there!' openers unless the user is greeting you for the first time in a while.
+10. Do NOT restate the user's question back to them unless clarification is genuinely needed.
+11. Do NOT append a conclusion/summary section to every answer, and do NOT end with 'Let me know if you want...', 'Hope this helps!', or similar closers.
+12. Vary your openings, transitions, and structure naturally from answer to answer — never use one fixed template for every response.
+13. If you don't know something, say so plainly. Never fabricate facts, memories, file contents, or tool usage.
 """
 
 
@@ -26,7 +32,9 @@ class PersonalityEngine:
         user_name: str = "",
         is_group: bool = False,
         group_title: str = "",
-        user_timezone: Optional[str] = None
+        user_timezone: Optional[str] = None,
+        mood_hint: Optional[str] = None,
+        length_hint: Optional[str] = None
     ) -> str:
         parts = [BASE_ASSISTANT_IDENTITY]
 
@@ -76,6 +84,14 @@ class PersonalityEngine:
                     style_lines.append("- Provide rigorous technical depth.")
                 if len(style_lines) > 1:
                     parts.append("\n".join(style_lines))
+
+        # Per-turn soft mood signal (ephemeral — never stored, never certain)
+        if mood_hint:
+            parts.append(mood_hint)
+
+        # Per-turn response length guidance
+        if length_hint:
+            parts.append(length_hint)
 
         return "\n\n".join(parts)
 
