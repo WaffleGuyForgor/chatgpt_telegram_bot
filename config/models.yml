@@ -1,34 +1,38 @@
-available_text_models: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+available_text_models: ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 
 info:
-  llama-3.3-70b-versatile:
+  openai/gpt-oss-20b:
     type: chat_completion
     vision: false
-    name: Llama 3.3 70B
-    description: Meta's Llama 3.3 70B — highly capable, 131K context, runs on Groq's fast inference engine. Best for complex reasoning and detailed tasks.
+    name: GPT-OSS 20B
+    description: OpenAI's open-weight 20B model on Groq — ultra-fast (1000 t/s) with a 131K context window. Great for chat, coding, and everyday tasks.
 
-    price_per_1000_input_tokens: 0.0
-    price_per_1000_output_tokens: 0.0
+    price_per_1000_input_tokens: 0.000075
+    price_per_1000_output_tokens: 0.0003
+
+    scores:
+      Smart: 4
+      Fast: 5
+      Cheap: 5
+
+  openai/gpt-oss-120b:
+    type: chat_completion
+    vision: false
+    name: GPT-OSS 120B
+    description: OpenAI's flagship open-weight 120B model on Groq — strongest reasoning and accuracy (500 t/s), 131K context. Best for complex tasks.
+
+    price_per_1000_input_tokens: 0.00015
+    price_per_1000_output_tokens: 0.0006
 
     scores:
       Smart: 5
       Fast: 4
-      Cheap: 5
+      Cheap: 4
 
-  llama-3.1-8b-instant:
-    type: chat_completion
-    vision: false
-    name: Llama 3.1 8B Instant
-    description: Meta's Llama 3.1 8B — ultra-fast (560 t/s), 131K context. Great for quick responses and simple tasks.
-
-    price_per_1000_input_tokens: 0.0
-    price_per_1000_output_tokens: 0.0
-
-    scores:
-      Smart: 3
-      Fast: 5
-      Cheap: 5
-
-  whisper:
+  whisper-large-v3-turbo:
     type: audio
-    price_per_1_min: 0.006
+    price_per_1_min: 0.000667
+
+  whisper-large-v3:
+    type: audio
+    price_per_1_min: 0.00185

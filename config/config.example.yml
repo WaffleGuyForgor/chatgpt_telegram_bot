@@ -9,7 +9,7 @@ groq_api_key: ""
 # llm_api_keys: "gsk_key1,gsk_key2,gsk_key3"
 
 # Default model
-default_model: "llama-3.3-70b-versatile"
+default_model: "openai/gpt-oss-20b"
 
 # Bot Owner Telegram user ID (enables /panel, /sethome, /broadcast)
 owner_id: 6274319204
