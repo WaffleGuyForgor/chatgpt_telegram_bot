@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Phase 2 Polish, Stage 3 (conversation intelligence + Telegram-native UX)
+- **Active-object tracking with expiry** (`bot/turn_analysis.py` + `context_engine`): "make it shorter" / "the second one" / "do that again" resolve against the previous answer — but only while the state is fresh (default TTL 45 min, `CONVERSATION_STATE_TTL_MINUTES`) and only when the message actually refers to it.
+- **Topic transitions**: lightweight topic signatures detect when the user switches subjects, so old context is not injected into unrelated conversations; topic history is kept.
+- **Multi-intent messages** are detected and the model is told to answer every part, not just the first sentence.
+- **Ambiguity handling**: bare fragments ("make it better") ask *one* short clarifying question only when there is nothing to refer to.
+- **Conversation repair**: "no, I meant the other file" triggers a correction hint (acknowledge, apply, don't repeat).
+- **Contextual buttons** (§21/§22, sparingly, DMs only): [Shorter] [More detail] [Another version] after detailed answers, [Explain] [Fix] [Optimize] after code — they run as normal conversational follow-ups (`CONTEXTUAL_BUTTONS_ENABLED` to disable).
+- **Session chat modes** `/mode`: normal · concise · deep · creative · technical · coding — per-conversation, saved preferences untouched.
+- **Conversation summary on demand** (§43): "summarize this conversation" returns a skimmable digest (topic / decisions / open points / action items) with a deterministic fallback if the summarizer model is unavailable.
+- New identity rules for fragment resolution, repair behaviour and genuine regeneration variation; tests + harness coverage for all of the above.
+
 ### Added — Phase 2 Polish, Stage 2 (memory lifecycle, scoped preferences, routing)
 - **Memory lifecycle metadata** (`bot/database.py`): memories now carry `confidence`, `stability`, `usage_count`, `last_confirmed_at` alongside importance/recency, plus `reinforce_memory()` (raise confidence, capped at 1.0) and `weaken_memory()` for contradictions.
 - **Memory reinforcement**: when the user restates something already known, the existing memory is reinforced (confidence/usage grow) instead of being duplicated.

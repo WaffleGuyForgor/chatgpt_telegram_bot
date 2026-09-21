@@ -136,6 +136,12 @@ rolling_summary_threshold = _get("rolling_summary_threshold", 16, int)
 memory_enabled = _get("memory_enabled", True, lambda v: v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes"))
 memory_retrieval_limit = _get("memory_retrieval_limit", 5, int)
 
+# How long an "active object"/topic reference stays usable for follow-ups (§6 expiry)
+conversation_state_ttl_minutes = _get("conversation_state_ttl_minutes", 45, int)
+
+# Contextual inline shortcut buttons after substantial answers (§21/§22)
+contextual_buttons_enabled = _get("contextual_buttons_enabled", True, lambda v: v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes"))
+
 # Memory scoring weights (semantic similarity, importance, recency, entity match)
 memory_weight_semantic = _get("memory_weight_semantic", 0.45, float)
 memory_weight_importance = _get("memory_weight_importance", 0.20, float)

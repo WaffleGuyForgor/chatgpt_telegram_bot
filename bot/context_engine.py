@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Any, Tuple
 
 import config
 import openai_utils
+import turn_analysis
 from personality import PersonalityEngine
 from memory import MemoryEngine
 from group_engine import GroupEngine
@@ -33,7 +34,8 @@ class ConversationContextEngine:
         document_context: Optional[str] = None,
         reply_context: Optional[str] = None,
         mood_hint: Optional[str] = None,
-        length_hint: Optional[str] = None
+        length_hint: Optional[str] = None,
+        extra_hint: Optional[str] = None
     ) -> List[Dict]:
         """
         Assembles full context with stable priority hierarchy:
@@ -56,7 +58,8 @@ class ConversationContextEngine:
             group_title=group_title,
             user_timezone=user_tz,
             mood_hint=mood_hint,
-            length_hint=length_hint
+            length_hint=length_hint,
+            extra_hint=extra_hint
         )
 
         # 2. Retrieve Relevant Long-Term Memory
@@ -80,11 +83,33 @@ class ConversationContextEngine:
         if rolling_summary:
             system_full += f"\n\n<conversation_summary>\nSummary of previous conversation:\n{rolling_summary}\n</conversation_summary>"
 
-        # 4. Active Object / Follow-up State
+        # 4. Active Object / Topic State (expiring + relevance-gated — §6/§7)
         state = self.db.get_conversational_state(entity_id)
-        last_output = state.get("last_output")
-        if last_output and any(p in current_user_text.lower() for p in ["it", "this", "that", "shorter", "casual", "alternative", "another version", "rewrite", "more"]):
-            system_full += f"\n\n<active_reference_object>\nThe user may be referring to the previous output:\n\"\"\"\n{last_output[:800]}\n\"\"\"\n</active_reference_object>"
+        last_output = state.get("last_output", "")
+
+        # Session chat mode (§25) — session-level preference, not a global one
+        mode_hint = turn_analysis.mode_instruction(state.get("chat_mode"))
+        if mode_hint:
+            system_full += f"\n\n{mode_hint}"
+
+        if turn_analysis.should_use_active_object(current_user_text, state, last_output):
+            system_full += (
+                "\n\n<active_reference_object>\n"
+                "The user is likely referring to your previous output:\n"
+                f"\"\"\"\n{last_output[:1200]}\n\"\"\"\n"
+                "</active_reference_object>"
+            )
+            active_topic = state.get("active_topic")
+            if active_topic:
+                system_full += f"\n\n<current_topic>{active_topic}</current_topic>"
+
+        # Multi-intent messages (§8): make sure every part gets answered
+        intent_count = turn_analysis.count_intents(current_user_text)
+        if intent_count > 1:
+            system_full += (
+                f"\n\nThe user's message contains about {intent_count} separate requests — "
+                "answer every part coherently, not just the first sentence."
+            )
 
         messages.append({"role": "system", "content": system_full})
 

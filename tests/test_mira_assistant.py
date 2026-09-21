@@ -1,7 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Add project root and bot directory to sys.path
 root_dir = Path(__file__).parent.parent.resolve()
@@ -15,6 +15,7 @@ from bot.bot import split_text_into_chunks
 import bot.config as bot_config
 from bot import openai_utils
 from bot import response_tuning
+from bot import turn_analysis
 from bot import bot as bot_module
 
 
@@ -387,6 +388,87 @@ class TestModelRouting(unittest.TestCase):
         self.assertEqual(stats["errors"], 1)
         self.assertEqual(stats["rate_limits"], 1)
         self.assertAlmostEqual(stats["avg_latency"], 1.0, places=2)
+
+
+class TestTurnAnalysis(unittest.TestCase):
+    """Stage 3: follow-ups, active-object expiry, topic shifts, intents, modes."""
+
+    def test_followup_detection(self):
+        ta = turn_analysis
+        self.assertTrue(ta.looks_like_followup("make it shorter", "Long answer about Docker", "how do I use docker"))
+        self.assertTrue(ta.looks_like_followup("yeah", "answer", "query"))
+        self.assertTrue(ta.looks_like_followup("the second one", "answer", "query"))
+        self.assertTrue(ta.looks_like_followup("do that again", "answer", "query"))
+        self.assertFalse(ta.looks_like_followup(
+            "Tell me about Kubernetes ingress controllers", "Docker basics", "docker"))
+
+    def test_active_object_expiry(self):
+        ta = turn_analysis
+        fresh = {"updated_at": datetime.now(), "last_output": "answer", "last_user_query": "docker"}
+        stale = {"updated_at": datetime.now() - timedelta(hours=3), "last_output": "answer", "last_user_query": "docker"}
+        self.assertTrue(ta.last_output_is_fresh(fresh))
+        self.assertFalse(ta.last_output_is_fresh(stale))
+        self.assertTrue(ta.should_use_active_object("make it shorter", fresh, "answer"))
+        self.assertFalse(ta.should_use_active_object("make it shorter", stale, "answer"))
+        self.assertFalse(ta.should_use_active_object("make it shorter", {}, ""))
+
+    def test_topic_shift_detection(self):
+        ta = turn_analysis
+        state = {
+            "active_topic_keywords": ["docker", "container"],
+            "last_user_query": "how do I fix docker",
+            "last_output": "restart the container",
+        }
+        self.assertFalse(ta.detect_topic_shift("which docker version should I use", state))
+        self.assertTrue(ta.detect_topic_shift("what GPU should I buy", state))
+        self.assertTrue(ta.detect_topic_shift("anything", {}))
+
+    def test_multi_intent_counting(self):
+        ta = turn_analysis
+        n = ta.count_intents("fix this config, explain why it broke, and tell me if the model is still using 9Router")
+        self.assertEqual(n, 3)
+        self.assertEqual(ta.count_intents("What is 9x9?"), 1)
+
+    def test_ambiguity_only_without_active_object(self):
+        ta = turn_analysis
+        self.assertTrue(ta.needs_clarification("make it better", has_active_object=False))
+        self.assertFalse(ta.needs_clarification("make it better", has_active_object=True))
+        self.assertFalse(ta.needs_clarification("Rewrite the deployment plan with rollback steps", has_active_object=False))
+
+    def test_regenerate_repair_summary_detection(self):
+        ta = turn_analysis
+        self.assertTrue(ta.is_regenerate_request("give me another version"))
+        self.assertTrue(ta.is_regenerate_request("try again"))
+        self.assertTrue(ta.is_repair_message("no, I meant the other file"))
+        self.assertTrue(ta.is_conversation_summary_request("summarize this conversation"))
+        self.assertFalse(ta.is_conversation_summary_request("what is a conversation"))
+
+    def test_chat_modes(self):
+        ta = turn_analysis
+        self.assertEqual(ta.mode_instruction("normal"), "")
+        self.assertIn("concise", ta.mode_instruction("concise"))
+        self.assertIn("coding", ta.mode_instruction("coding"))
+        self.assertEqual(ta.mode_instruction(None), "")
+        self.assertEqual(ta.mode_instruction("bogus"), "")
+
+    def test_contextual_buttons_are_sparing_and_wired(self):
+        ta = turn_analysis
+        self.assertEqual(ta.contextual_buttons("tiny"), [])
+        self.assertEqual(ta.contextual_buttons("normal"), [])
+        self.assertTrue(ta.contextual_buttons("detailed"))
+
+        code_rows = ta.contextual_buttons("normal", has_code=True)
+        labels = [label for row in code_rows for label, _ in row]
+        self.assertIn("🛠 Fix", labels)
+
+        actions = [a for size in ("detailed", "deep")
+                   for row in ta.contextual_buttons(size) for _, a in row]
+        actions += [a for row in code_rows for _, a in row]
+        for action in actions:
+            self.assertIn(action, ta.FOLLOWUP_INSTRUCTIONS, f"button '{action}' has no instruction")
+        # Telegram callback_data limit: "followup|<action>" must stay tiny
+        for action in actions:
+            self.assertLessEqual(len(f"followup|{action}".encode()), 64)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ import config
 import database
 import openai_utils
 import response_tuning
+import turn_analysis
 from memory import MemoryEngine
 from multimodal import MultimodalInterpreter
 from personality import PersonalityEngine
@@ -75,6 +76,7 @@ You can talk to me completely naturally — no special commands required:
 <b>Quick Commands:</b>
 ⚪ /new – Start fresh dialog
 ⚪ /model – Switch AI model (anyone can pick)
+⚪ /mode – Session chat mode (concise, deep, coding…)
 ⚪ /memory – View what I remember about you
 ⚪ /memory_clear – Clear all my memories of you
 ⚪ /status – Bot status & stats
@@ -239,6 +241,63 @@ async def register_chat_and_user(update: Update, context: CallbackContext):
         logger.error(f"Database error in register_chat_and_user: {e}")
 
 
+async def build_conversation_summary(entity_id: int) -> str:
+    """
+    On-demand conversation digest (§43): main topic, decisions, open points,
+    and action items — built from the current dialog history.
+    """
+    dialogs = db.get_dialog_messages(entity_id) or []
+    if not dialogs:
+        return "We haven't talked about anything yet in this dialog. Tell me what you're working on and I'll keep track."
+
+    recent = dialogs[-20:]
+    transcript_lines = []
+    for turn in recent:
+        user_val = turn.get("user", "")
+        if isinstance(user_val, list):
+            user_val = "[attachment or image]"
+        transcript_lines.append(f"User: {str(user_val)[:300]}")
+        transcript_lines.append(f"Assistant: {str(turn.get('bot', ''))[:300]}")
+
+    existing_summary = db.get_dialog_summary(entity_id) or ""
+    prompt = (
+        "Summarize this conversation for the user in a compact, skimmable form with these sections:\n"
+        "• Main topic\n• Key decisions\n• Open / unresolved points\n• Action items\n\n"
+        "Skip small talk. If a section has nothing, write 'None'.\n\n"
+        f"Earlier summary: {existing_summary or 'None'}\n\n"
+        + "\n".join(transcript_lines)
+    )
+
+    try:
+        out = await openai_utils.fast_chat_completion(
+            [
+                {"role": "system", "content": "You are a concise conversation summarizer for a personal assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=450,
+        )
+    except Exception as e:
+        logger.warning(f"Conversation summary failed: {e}")
+        out = ""
+
+    if out:
+        return f"🧾 <b>Conversation summary</b>\n\n{html.escape(out)}"
+
+    # Deterministic fallback if the summarizer model is unavailable
+    topics = turn_analysis.extract_topic_keywords(
+        " ".join(str(t.get("user", "")) for t in recent)
+    )
+    last_user_msg = recent[-1].get("user", "")
+    return (
+        "🧾 <b>Conversation summary</b>\n\n"
+        f"• Main topic: {html.escape(', '.join(topics) or 'general chat')}\n"
+        f"• Turns in this dialog: {len(dialogs)}\n"
+        f"• Your last message: {html.escape(str(last_user_msg)[:200])}\n"
+        "<i>(Detailed summarization is unavailable right now.)</i>"
+    )
+
+
 async def should_respond_in_group(update: Update, context: CallbackContext) -> bool:
     message = update.message
     if not message:
@@ -306,6 +365,26 @@ async def process_user_turn(
     if initial_status is None:
         initial_status = response_tuning.pick_status_message(request_size)
 
+    # Prior conversation state: active object, topic, session mode
+    prior_state = db.get_conversational_state(entity_id) or {}
+    has_active_object = turn_analysis.should_use_active_object(
+        clean_text, prior_state, prior_state.get("last_output", "")
+    )
+
+    # Per-turn behavioural hints (repair / regeneration) (§18, §23)
+    extra_hints = []
+    if turn_analysis.is_repair_message(clean_text):
+        extra_hints.append(
+            "The user is correcting you. Accept the correction immediately, apply it to the active object, "
+            "and do not repeat the earlier mistake or defend the previous interpretation."
+        )
+    if turn_analysis.is_regenerate_request(clean_text) and prior_state.get("last_output"):
+        extra_hints.append(
+            "The user wants another version of the previous answer: same task, but noticeably different "
+            "wording, structure or angle."
+        )
+    extra_hint = "\n".join(extra_hints)
+
     # 1. Natural Language Memory Intent Check
     intent, intent_arg = memory_engine.detect_memory_intent(clean_text)
     is_off_the_record = (intent == "off_the_record")
@@ -358,6 +437,21 @@ async def process_user_turn(
             )
         return
 
+    # 1c. Conversation summary on demand (§43)
+    if turn_analysis.is_conversation_summary_request(clean_text):
+        await update.message.chat.send_action(action=ChatAction.TYPING)
+        summary = await build_conversation_summary(entity_id)
+        await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
+        return
+
+    # 1d. Ambiguity: only ask one short question when there is nothing to refer to (§9)
+    if turn_analysis.needs_clarification(clean_text, has_active_object):
+        await update.message.reply_text(
+            "What should I look at? Point at your last message, or send me the text, file or screenshot.",
+            reply_to_message_id=update.message.id
+        )
+        return
+
     # 2. Natural Group Digest Check ("What did I miss?")
     if is_group and group_engine.is_digest_request(clean_text):
         await update.message.chat.send_action(action=ChatAction.TYPING)
@@ -399,7 +493,8 @@ async def process_user_turn(
         document_context=document_context,
         reply_context=reply_context,
         mood_hint=response_tuning.mood_instruction(mood),
-        length_hint=response_tuning.length_instruction(request_size)
+        length_hint=response_tuning.length_instruction(request_size),
+        extra_hint=extra_hint or None
     )
 
     # 6. Lock Semaphore per-user (so different users can talk simultaneously in groups)
@@ -537,6 +632,25 @@ async def process_user_turn(
                     except Exception:
                         await update.message.reply_text(chunk)
 
+            # Contextual shortcut buttons for substantial answers (§21/§22) — used sparingly
+            if config.contextual_buttons_enabled and not is_group:
+                button_rows = turn_analysis.contextual_buttons(
+                    request_size, turn_analysis.answer_contains_code(answer)
+                )
+                if button_rows:
+                    try:
+                        await context.bot.edit_message_reply_markup(
+                            chat_id=placeholder.chat_id,
+                            message_id=placeholder.message_id,
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton(label, callback_data=f"followup|{action}")
+                                 for label, action in row]
+                                for row in button_rows
+                            ])
+                        )
+                    except Exception:
+                        pass
+
             # Persist dialog message
             turn_record = {
                 "user": formatted_user_text,
@@ -549,10 +663,19 @@ async def process_user_turn(
                                     n_input_tokens, n_output_tokens)
 
             # Update conversational state for natural follow-ups ("make it shorter", "another version")
-            db.set_conversational_state(entity_id, {
+            # plus lightweight topic tracking with expiry (§6/§7)
+            state_update = {
                 "last_output": answer,
-                "last_user_query": clean_text
-            })
+                "last_user_query": clean_text,
+            }
+            if turn_analysis.detect_topic_shift(clean_text, prior_state):
+                topic_history = list(prior_state.get("topic_history") or [])[-4:]
+                if prior_state.get("active_topic"):
+                    topic_history.append(prior_state["active_topic"])
+                state_update["active_topic"] = clean_text[:120]
+                state_update["active_topic_keywords"] = turn_analysis.extract_topic_keywords(clean_text)
+                state_update["topic_history"] = topic_history
+            db.set_conversational_state(entity_id, state_update)
 
             # Silently adapt user communication style with correct scope (§13/§15)
             personality.adapt_user_style_from_message(
@@ -1030,6 +1153,97 @@ async def model_picker_callback_handle(update: Update, context: CallbackContext)
         logger.warning(f"Could not edit model picker message: {e}")
 
 
+# =====================================================================
+# CONTEXTUAL FOLLOW-UP BUTTONS + CHAT MODES (§21–§25)
+# =====================================================================
+
+class CallbackTurnAdapter:
+    """
+    Adapts a callback-query update so it can flow through process_user_turn().
+    Buttons are shortcuts for normal conversational follow-ups, not a separate
+    command system — the action text simply becomes the user's next message.
+    """
+
+    def __init__(self, update: Update):
+        self._update = update
+        self.update_id = update.update_id
+        self.effective_user = update.effective_user
+        self.effective_chat = update.effective_chat
+        self.message = update.callback_query.message
+
+
+async def followup_callback_handle(update: Update, context: CallbackContext):
+    """Handles [Shorter] / [More detail] / [Regenerate] / [Explain] / [Fix] / [Optimize]."""
+    query = update.callback_query
+    parts = (query.data or "").split("|", 2)
+    action = parts[1] if len(parts) > 1 else ""
+    instruction = turn_analysis.FOLLOWUP_INSTRUCTIONS.get(action)
+    if not instruction:
+        await query.answer("Action unavailable.", show_alert=True)
+        return
+
+    await query.answer()
+    await register_chat_and_user(update, context)
+
+    # Buttons are one-shot shortcuts — drop them once used
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await process_user_turn(
+        update=CallbackTurnAdapter(update),
+        context=context,
+        raw_text=instruction,
+        initial_status=None
+    )
+
+
+async def mode_handle(update: Update, context: CallbackContext):
+    """Session-level chat modes (§25) — apply to this conversation only."""
+    await register_chat_and_user(update, context)
+    entity_id = get_entity_id(update)
+    state = db.get_conversational_state(entity_id) or {}
+    current = state.get("chat_mode", turn_analysis.DEFAULT_CHAT_MODE)
+
+    text = (
+        "🎛 <b>Chat mode</b>\n\n"
+        f"Active for this conversation: <b>{html.escape(str(current))}</b>\n"
+        "Modes change how I answer here — your saved preferences stay untouched.\n\n"
+        "normal · concise · deep · creative · technical · coding"
+    )
+
+    rows = []
+    for mode in turn_analysis.CHAT_MODES:
+        label = f"✅ {mode}" if mode == current else mode.capitalize()
+        rows.append([InlineKeyboardButton(label, callback_data=f"mode|set|{mode}")])
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def mode_callback_handle(update: Update, context: CallbackContext):
+    query = update.callback_query
+    parts = (query.data or "").split("|", 2)
+    if len(parts) < 3 or parts[1] != "set" or parts[2] not in turn_analysis.CHAT_MODES:
+        await query.answer("Unknown mode.", show_alert=True)
+        return
+
+    mode = parts[2]
+    entity_id = get_entity_id(update)
+    try:
+        db.set_conversational_state(entity_id, {"chat_mode": mode})
+    except Exception as e:
+        logger.error(f"Failed to set chat mode for {entity_id}: {e}")
+        await query.answer("Could not save the mode, try again.", show_alert=True)
+        return
+
+    await query.answer(f"Mode: {mode}")
+    await query.edit_message_text(
+        f"🎛 Chat mode set to <b>{mode}</b> for this conversation.",
+        parse_mode=ParseMode.HTML
+    )
+
+
 # --- Owner Panel ---
 
 def get_owner_panel_main():
@@ -1235,6 +1449,7 @@ async def post_init(application: Application):
         BotCommand("/new", "Start fresh dialog"),
         BotCommand("/help", "Show help message"),
         BotCommand("/model", "🤖 Switch AI model"),
+        BotCommand("/mode", "🎛 Session chat mode"),
         BotCommand("/status", "📊 Bot status & stats"),
         BotCommand("/ping", "🏓 Latency check"),
         BotCommand("/memory", "🧠 View my memories"),
@@ -1280,6 +1495,11 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("model", model_handle))
     application.add_handler(CommandHandler("models", model_handle))
     application.add_handler(CallbackQueryHandler(model_picker_callback_handle, pattern="^model\\|"))
+
+    # Session chat modes + contextual follow-up buttons
+    application.add_handler(CommandHandler("mode", mode_handle))
+    application.add_handler(CallbackQueryHandler(mode_callback_handle, pattern="^mode\\|"))
+    application.add_handler(CallbackQueryHandler(followup_callback_handle, pattern="^followup\\|"))
 
     # Owner commands
     application.add_handler(CommandHandler("panel", panel_command_handle))

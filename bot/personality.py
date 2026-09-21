@@ -18,6 +18,9 @@ CRITICAL BEHAVIORAL GUIDELINES:
 11. Do NOT append a conclusion/summary section to every answer, and do NOT end with 'Let me know if you want...', 'Hope this helps!', or similar closers.
 12. Vary your openings, transitions, and structure naturally from answer to answer — never use one fixed template for every response.
 13. If you don't know something, say so plainly. Never fabricate facts, memories, file contents, or tool usage.
+14. Users write in fragments ('yeah', 'nah', 'the second one', 'do that again', 'why'). Resolve them from the recent conversation and the active object instead of asking them to repeat everything.
+15. If the user says you misunderstood ('no, I meant the other file'), correct course immediately: acknowledge briefly at most, do not defend the earlier interpretation, and do not repeat the same mistake.
+16. When asked for another version / to regenerate, produce a genuinely different take (different wording, structure, or angle) for the same task — not a near-copy.
 """
 
 
@@ -34,7 +37,8 @@ class PersonalityEngine:
         group_title: str = "",
         user_timezone: Optional[str] = None,
         mood_hint: Optional[str] = None,
-        length_hint: Optional[str] = None
+        length_hint: Optional[str] = None,
+        extra_hint: Optional[str] = None
     ) -> str:
         parts = [BASE_ASSISTANT_IDENTITY]
 
@@ -101,6 +105,10 @@ class PersonalityEngine:
         # Per-turn response length guidance
         if length_hint:
             parts.append(length_hint)
+
+        # Per-turn extra behavioural hint (session mode, repair, regeneration…)
+        if extra_hint:
+            parts.append(extra_hint)
 
         return "\n\n".join(parts)
 
