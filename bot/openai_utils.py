@@ -7,7 +7,15 @@ from io import BytesIO
 from typing import List, Dict, Optional, Tuple, AsyncGenerator
 
 import tiktoken
-from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIError
+from openai import (
+    AsyncOpenAI,
+    BadRequestError,
+    RateLimitError,
+    APIError,
+    AuthenticationError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 
 import config
 
@@ -127,6 +135,9 @@ class ChatGPT:
                 logger.warning(f"Rate limit on key #{key_idx} (attempt {attempt + 1}), rotating...")
                 await asyncio.sleep(1.0)
                 continue
+            except (AuthenticationError, NotFoundError, PermissionDeniedError) as e:
+                logger.error(f"Non-retryable error on key #{key_idx}: {e}")
+                raise
             except BadRequestError as e:
                 if "context_length" in str(e).lower():
                     raise
@@ -187,6 +198,10 @@ class ChatGPT:
                 logger.warning(f"Rate limit on key #{key_idx} during streaming, rotating...")
                 await asyncio.sleep(1.0)
                 continue
+            except (AuthenticationError, NotFoundError, PermissionDeniedError) as e:
+                # Rotating keys won't help — the key is bad or the model doesn't exist.
+                logger.error(f"Non-retryable error on key #{key_idx}: {e}")
+                raise
             except Exception as e:
                 last_error = e
                 logger.error(f"Streaming error on key #{key_idx}: {e}")

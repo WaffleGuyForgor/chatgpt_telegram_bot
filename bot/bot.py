@@ -102,6 +102,40 @@ def get_entity_id(update: Update) -> int:
     return update.effective_user.id
 
 
+def resolve_model(entity_id: int) -> str:
+    """
+    Resolves the model to use for a user/group, validating it against models.yml.
+
+    MongoDB persists a per-user `current_model`, which can go stale when the
+    configured provider/model list changes (e.g. switching OpenRouter -> Groq).
+    Any stored model that is no longer in models.yml is treated as invalid,
+    reset to config.default_model, and healed in the database.
+    """
+    valid_models = config.models.get("info", {})
+
+    if entity_id > 0:
+        stored = db.get_user_attribute(entity_id, "current_model")
+    else:
+        stored = db.get_chat_attribute(entity_id, "current_model")
+
+    if stored and stored in valid_models:
+        return stored
+
+    # Stale or missing model — fall back to the configured default and persist the fix
+    fallback = config.default_model
+    if stored:
+        logger.warning(f"Model '{stored}' is no longer available; resetting entity {entity_id} to '{fallback}'")
+        try:
+            if entity_id > 0:
+                db.set_user_attribute(entity_id, "current_model", fallback)
+            else:
+                db.set_chat_attribute(entity_id, "current_model", fallback)
+        except Exception as e:
+            logger.error(f"Failed to persist model reset for {entity_id}: {e}")
+
+    return fallback
+
+
 def is_owner(user_id: int) -> bool:
     if config.owner_id is None:
         return False
@@ -300,12 +334,7 @@ async def process_user_turn(
         await update.message.reply_text("⏳ Working on your previous request, please wait a moment…", reply_to_message_id=update.message.id)
         return
 
-    current_model = (
-        db.get_user_attribute(entity_id, "current_model")
-        if entity_id > 0
-        else db.get_chat_attribute(entity_id, "current_model", config.default_model)
-    ) or config.default_model
-
+    current_model = resolve_model(entity_id)
     chatgpt_client = openai_utils.ChatGPT(model=current_model)
 
     async def execute_turn():
@@ -655,11 +684,7 @@ async def status_handle(update: Update, context: CallbackContext):
     pool_stats = openai_utils.get_api_pool().get_stats()
     mem_count = len(db.get_active_memories(f"user:{entity_id}", entity_id))
 
-    model = (
-        db.get_user_attribute(entity_id, "current_model")
-        if entity_id > 0
-        else db.get_chat_attribute(entity_id, "current_model", config.default_model)
-    ) or config.default_model
+    model = resolve_model(entity_id)
 
     total_users = db.get_total_users_count()
     total_groups = db.get_total_groups_count()
