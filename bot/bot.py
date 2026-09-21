@@ -99,7 +99,20 @@ PROVIDER_DISPLAY_NAMES = {
     "groq": "Groq",
     "openrouter": "OpenRouter",
     "dahl": "Dahl",
+    "nine_router": "9Router",
 }
+
+# Providers whose buttons don't show a provider label in the picker (§ 9Router: no providers)
+NO_PROVIDER_LABEL = {"nine_router"}
+
+
+def model_button_label(model_id: str, info: dict) -> str:
+    """Display name + provider suffix for picker buttons (9Router models get no provider tag)."""
+    name = info.get("name", model_id)
+    provider = info.get("provider", "groq")
+    if provider in NO_PROVIDER_LABEL:
+        return name
+    return f"{name} · {PROVIDER_DISPLAY_NAMES.get(provider, provider)}"
 
 # Persian note shown in the model picker: if a model is rate-limited, pick another one
 MODEL_PICKER_NOTE_FA = (
@@ -1077,16 +1090,19 @@ def build_model_picker(entity_id: int):
         info = config.models.get("info", {}).get(model_id, {})
         name = info.get("name", model_id)
         provider = info.get("provider", "groq")
-        provider_label = PROVIDER_DISPLAY_NAMES.get(provider, provider)
 
         label = ""
         if model_id == current:
             label += "✅ "
         if info.get("recommended"):
             label += "⭐ "
-        label += f"{name} · {provider_label}"
+        label += model_button_label(model_id, info)
 
-        buttons.append([InlineKeyboardButton(label, callback_data=f"model|set|{model_id}")])
+        callback_data = f"model|set|{model_id}"
+        if len(callback_data.encode("utf-8")) > 64:
+            logger.warning(f"Skipping model '{model_id}' in picker: callback_data exceeds Telegram's 64-byte limit")
+            continue
+        buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
 
     return text, InlineKeyboardMarkup(buttons)
 
@@ -1379,9 +1395,7 @@ async def owner_panel_callback_handle(update: Update, context: CallbackContext):
         buttons = []
         for m in config.models.get("available_text_models", []):
             m_info = config.models["info"].get(m, {})
-            m_name = m_info.get("name", m)
-            m_provider = PROVIDER_DISPLAY_NAMES.get(m_info.get("provider", "groq"), m_info.get("provider", "groq"))
-            buttons.append([InlineKeyboardButton(f"{m_name} · {m_provider}", callback_data=f"owner_panel|set_model|{m}")])
+            buttons.append([InlineKeyboardButton(model_button_label(m, m_info), callback_data=f"owner_panel|set_model|{m}")])
         buttons.append([InlineKeyboardButton("« Back", callback_data="owner_panel|main")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
 

@@ -19,6 +19,12 @@ groq_api_key: ""
 # dahl_api_keys: "dahl_key1,dahl_key2"  # multiple keys for rotation (optional)
 # dahl_base_url: "https://inference.dahl.global/v1"  # default, no need to set
 
+# 9Router (generic catch-all provider — just list model IDs, display names are auto-generated)
+# nine_router_api_key: ""
+# nine_router_api_keys: "n9_key1,n9_key2"  # multiple keys for rotation (optional)
+# nine_router_models: "openrouter/deepseek-v4.1-flash,oc/glm-5.3,claude-opus-4.8"
+# nine_router_base_url: "https://api.9router.com/v1"  # default, override if yours differs
+
 # Default model
 default_model: "openai/gpt-oss-20b"
 

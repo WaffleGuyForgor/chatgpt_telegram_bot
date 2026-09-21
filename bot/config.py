@@ -1,4 +1,5 @@
 import os
+import re
 import yaml
 import dotenv
 from pathlib import Path
@@ -96,11 +97,21 @@ else:
     dahl_api_keys = [_dahl_single_key] if _dahl_single_key else []
 dahl_base_url = _get("dahl_base_url") or "https://inference.dahl.global/v1"
 
+# 9Router gateway (generic catch-all provider — models come from a variable)
+_nine_router_single_key = _get("nine_router_api_key") or _get("9router_api_key") or ""
+_nine_router_multi_keys = _get("nine_router_api_keys") or _get("9router_api_keys") or ""
+if _nine_router_multi_keys:
+    nine_router_api_keys = [k.strip() for k in str(_nine_router_multi_keys).split(",") if k.strip()]
+else:
+    nine_router_api_keys = [_nine_router_single_key] if _nine_router_single_key else []
+nine_router_base_url = _get("nine_router_base_url") or _get("9router_base_url") or "https://api.9router.com/v1"
+
 # Provider registry: name -> (api keys, base url). "groq" is the default provider.
 provider_registry = {
     "groq": {"keys": llm_api_keys, "base_url": llm_base_url},
     "openrouter": {"keys": openrouter_api_keys, "base_url": openrouter_base_url},
     "dahl": {"keys": dahl_api_keys, "base_url": dahl_base_url},
+    "nine_router": {"keys": nine_router_api_keys, "base_url": nine_router_base_url},
 }
 import logging as _cfg_log
 _cfg_log.getLogger(__name__).info(f"LLM API keys loaded: {len(llm_api_keys)} key(s) for {llm_base_url}")
@@ -193,6 +204,64 @@ with open(config_dir / 'chat_modes.yml', 'r', encoding="utf-8") as f:
 # models
 with open(config_dir / 'models.yml', 'r', encoding="utf-8") as f:
     models = yaml.safe_load(f)
+
+
+def pretty_model_name(model_id: str) -> str:
+    """
+    Auto display name for 9Router models:
+      openrouter/deepseek-v4.1-flash -> Deepseek v4.1 Flash
+      oc/glm-5.3                     -> GLM 5.3
+      claude-opus-4.8                -> claude opus 4.8
+    Vendor prefix (before '/') is dropped; with a prefix the name is prettified
+    (short alpha words become acronyms, version tokens stay as-is); without a
+    prefix the ID is used as-is with separators turned into spaces.
+    """
+    mid = (model_id or "").strip()
+    if "/" in mid:
+        base = mid.split("/", 1)[1]
+        words = []
+        for w in re.split(r"[-_]+", base):
+            if not w:
+                continue
+            if re.match(r"^v?\d", w, re.IGNORECASE):
+                words.append(w)          # version token: 5.3, v4.1
+            elif len(w) <= 4 and w.isalpha():
+                words.append(w.upper())  # acronym: glm -> GLM
+            else:
+                words.append(w.capitalize())
+        return " ".join(words) or mid
+    return mid.replace("-", " ").replace("_", " ")
+
+
+def register_9router_models(models_cfg: dict, model_ids) -> int:
+    """Registers comma-separated 9Router models dynamically into the models config."""
+    added = 0
+    for mid in model_ids:
+        mid = mid.strip()
+        if not mid or mid in models_cfg.get("info", {}):
+            continue
+        models_cfg.setdefault("available_text_models", []).append(mid)
+        models_cfg.setdefault("info", {})[mid] = {
+            "provider": "nine_router",
+            "type": "chat_completion",
+            "vision": False,
+            "name": pretty_model_name(mid),
+            "description": f"9Router model ({mid}) — auto-registered from NINE_ROUTER_MODELS.",
+            "price_per_1000_input_tokens": 0.0,
+            "price_per_1000_output_tokens": 0.0,
+        }
+        added += 1
+    return added
+
+
+# 9Router dynamic models: NINE_ROUTER_MODELS / 9ROUTER_MODELS = id1,id2,id3
+_nine_router_models_raw = _get("nine_router_models") or _get("9router_models") or ""
+nine_router_models = [m.strip() for m in str(_nine_router_models_raw).split(",") if m.strip()]
+if nine_router_models:
+    _n_added = register_9router_models(models, nine_router_models)
+    _cfg_log.getLogger(__name__).info(
+        f"9Router: registered {len(nine_router_models)} model(s) ({_n_added} new) for {nine_router_base_url}"
+    )
 
 # default model – env override, else first available from models.yml
 default_model = _get("default_model") or models["available_text_models"][0]

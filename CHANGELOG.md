@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — 9Router provider (dynamic models from a variable)
+- **9Router support**: a generic OpenAI-compatible catch-all provider. Set `NINE_ROUTER_MODELS` (comma-separated model IDs, aliases: `9ROUTER_MODELS`) and they appear in `/model` automatically — no `models.yml` edits needed.
+- **Auto-generated display names**: `openrouter/deepseek-v4.1-flash` → *Deepseek v4.1 Flash*, `oc/glm-5.3` → *GLM 5.3*, `claude-opus-4.8` → *claude opus 4.8* (vendor prefix dropped, acronyms uppercased, version tokens preserved; no provider label shown on 9Router buttons).
+- `NINE_ROUTER_API_KEY` / `NINE_ROUTER_API_KEYS` (multi-key rotation) and `NINE_ROUTER_BASE_URL` (default `https://api.9router.com/v1`) configure the provider; all existing features (key rotation, fallback chain, routing, /status) work with it.
+- Picker buttons now skip models whose callback data would exceed Telegram's 64-byte limit.
+
 ### Added — Phase 2 Polish, Stage 3 (conversation intelligence + Telegram-native UX)
 - **Active-object tracking with expiry** (`bot/turn_analysis.py` + `context_engine`): "make it shorter" / "the second one" / "do that again" resolve against the previous answer — but only while the state is fresh (default TTL 45 min, `CONVERSATION_STATE_TTL_MINUTES`) and only when the message actually refers to it.
 - **Topic transitions**: lightweight topic signatures detect when the user switches subjects, so old context is not injected into unrelated conversations; topic history is kept.

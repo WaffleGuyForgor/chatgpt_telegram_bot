@@ -471,5 +471,42 @@ class TestTurnAnalysis(unittest.TestCase):
             self.assertLessEqual(len(f"followup|{action}".encode()), 64)
 
 
+class TestNineRouter(unittest.TestCase):
+    """9Router: dynamic models from a variable with auto-generated display names."""
+
+    def test_pretty_model_name(self):
+        pn = bot_config.pretty_model_name
+        self.assertEqual(pn("openrouter/deepseek-v4.1-flash"), "Deepseek v4.1 Flash")
+        self.assertEqual(pn("oc/glm-5.3"), "GLM 5.3")
+        self.assertEqual(pn("claude-opus-4.8"), "claude opus 4.8")
+        self.assertEqual(pn("meta/llama-4-scout"), "Llama 4 Scout")
+
+    def test_register_9router_models(self):
+        models_cfg = {"available_text_models": ["openai/gpt-oss-20b"], "info": {"openai/gpt-oss-20b": {}}}
+        added = bot_config.register_9router_models(
+            models_cfg, ["openrouter/deepseek-v4.1-flash", "oc/glm-5.3", "openai/gpt-oss-20b"]
+        )
+        self.assertEqual(added, 2)  # duplicates are skipped
+        self.assertIn("openrouter/deepseek-v4.1-flash", models_cfg["available_text_models"])
+        info = models_cfg["info"]["oc/glm-5.3"]
+        self.assertEqual(info["provider"], "nine_router")
+        self.assertEqual(info["name"], "GLM 5.3")
+        self.assertEqual(info["type"], "chat_completion")
+
+    def test_9router_models_hidden_provider_label(self):
+        label = bot_module.model_button_label(
+            "oc/glm-5.3", {"name": "GLM 5.3", "provider": "nine_router"}
+        )
+        self.assertEqual(label, "GLM 5.3")  # no provider tag for 9Router models
+        groq_label = bot_module.model_button_label(
+            "openai/gpt-oss-20b", {"name": "GPT-OSS 20B", "provider": "groq"}
+        )
+        self.assertIn("Groq", groq_label)
+
+    def test_nine_router_provider_configured_in_registry(self):
+        self.assertIn("nine_router", bot_config.provider_registry)
+        self.assertIn("nine_router", bot_module.PROVIDER_DISPLAY_NAMES)
+
+
 if __name__ == "__main__":
     unittest.main()
