@@ -248,8 +248,11 @@ async def fast_chat_completion(
 
 
 async def get_embedding(text: str) -> Optional[List[float]]:
-    """Fetches text embedding if an embedding provider is reachable."""
+    """Fetches text embedding if an embedding provider is reachable.
+    Skips silently for providers that don't support embeddings (e.g. Groq)."""
     if not text or not config.embedding_api_key:
+        return None
+    if not config.embedding_enabled:
         return None
     try:
         res = await embedding_client.embeddings.create(

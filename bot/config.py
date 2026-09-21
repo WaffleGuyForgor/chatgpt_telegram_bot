@@ -103,7 +103,8 @@ memory_weight_importance = _get("memory_weight_importance", 0.20, float)
 memory_weight_recency = _get("memory_weight_recency", 0.15, float)
 memory_weight_entity = _get("memory_weight_entity", 0.20, float)
 
-# Optional embedding API
+# Optional embedding API (disabled by default — Groq doesn't support embeddings)
+embedding_enabled = _get("embedding_enabled", False, lambda v: v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes"))
 embedding_api_key = _get("embedding_api_key") or llm_api_key
 embedding_base_url = _get("embedding_base_url") or llm_base_url
 embedding_model = _get("embedding_model", "text-embedding-3-small")
